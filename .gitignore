@@ -19,3 +19,22 @@ src-tauri/gen/
 *.log
 .DS_Store
 Thumbs.db
+
+# Additional Vite / editor outputs
+logs/
+dist-ssr/
+*.local
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# IDE settings (keep suggested extensions)
+.vscode/*
+!.vscode/extensions.json
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?

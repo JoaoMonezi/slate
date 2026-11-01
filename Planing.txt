@@ -1,0 +1,95 @@
+Contexto do Projeto
+Aplicativo desktop de notas "local-first" desenhado para fricção zero e captura rápida. O app sempre abre instantaneamente em um rascunho em branco, permitindo a organização em pastas ou tags apenas depois da escrita. A experiência de edição replica o Notion (edição em blocos, slash menu), mas o armazenamento salva tudo em arquivos locais de texto puro (.md), garantindo que o cofre de dados seja facilmente legível por IAs no futuro.
+
+Perfil e Experiência do Desenvolvedor
+Background sólido em Python e no ecossistema frontend moderno (React, Next.js, Tailwind, TypeScript). Atualmente cursando Ciência da Computação e estudando C (CS50, manipulação de ponteiros, alocação de memória e estruturas de dados de baixo nível). Zero experiência prévia com Rust. A estratégia é delegar os Commands do Tauri e integrações do OS para a IA, utilizando a base lógica de C para compreender o Borrow Checker do Rust.
+
+Premissas e Limitações
+
+Arquitetura SPA leve em vez de frameworks pesados (Vite substitui Next.js por não exigir SSR em desktop).
+
+Armazenamento restrito ao sistema de arquivos local do usuário (raw file storage).
+
+O backend em Rust deve ser estritamente utilitário, operando apenas I/O de arquivos e chamadas de banco de dados.
+
+Stack Tecnológica
+
+Framework: Tauri (Backend em Rust, Frontend web).
+
+Interface: React, Vite, TypeScript, Tailwind CSS.
+
+Editor: BlockNote ou Novel (construídos sobre o Tiptap).
+
+Busca e Indexação: SQLite com FTS5 (Full-Text Search) integrado via Rust.
+
+Roadmap de Execução
+
+Setup e Editor: Inicialização via create-tauri-app e integração do BlockNote/Novel na tela principal para validar a digitação em blocos.
+
+Sistema de Arquivos: Criação dos Commands em Rust para ler, escrever e converter o estado JSON do editor em arquivos .md locais.
+
+Navegação e File Tree: Leitura recursiva de diretórios para montar a sidebar lateral, incluindo lógica de mover arquivos (Drag & Drop).
+
+Indexação e Busca: Configuração do SQLite no backend, parsing assíncrono dos arquivos .md e construção da paleta de comandos para busca global instantânea via FTS5.
+
+CI/CD: Configuração de workflows no GitHub Actions para automatizar o build e o release dos instaladores .exe.
+## Aditivo do discovery — direção acordada em 2026-11-01
+
+Esta seção complementa as notas iniciais e registra as decisões tomadas durante o discovery.
+
+### Produto e fluxo principal
+
+- O MVP será voltado para Windows.
+- Cada acionamento do atalho do Slate inicia uma nota nova em `Draft`.
+- `Draft` é uma pasta real dentro do vault. A nota é persistida nela desde a criação; fechar o app não descarta o conteúdo.
+- Rascunhos anteriores continuam na pasta `Draft`; o atalho inicia uma nota nova em vez de reabrir todos os rascunhos como abas.
+- Um rascunho sai de `Draft` quando o usuário o organiza para outra pasta. A organização será acionada pela interface.
+- O início do projeto será focado em texto. Recursos avançados do editor serão definidos depois.
+- O editor inicial será BlockNote. Um protótipo servirá para avaliar se atende ao fluxo; um editor próprio só será considerado se houver limitações concretas.
+
+### Navegação e organização
+
+- A interface deve ser simples e discreta, com ações curtas e fáceis de encontrar, seguindo a referência visual de uma barra de menus enxuta.
+- Direção inicial da barra: `Draft`, `Menu` e `Search`.
+- `Menu` dá acesso à pasta Draft, às pastas do vault e às ações de organização.
+- A árvore representa pastas e arquivos reais no disco. Mover uma nota pela interface move o arquivo correspondente.
+- Pastas representam localização; metadados descrevem características da nota. A busca poderá combinar texto, pasta e metadados.
+- Links entre notas devem ser gravados nos arquivos Markdown em formato compatível com Obsidian, como `[[Nome da nota]]`.
+
+### Dados e busca
+
+- Os arquivos Markdown são a fonte principal do conteúdo e devem continuar legíveis fora do Slate.
+- Metadados também devem ser persistidos localmente. O formato exato ainda será proposto antes de implementação.
+- SQLite/FTS5 será um índice local derivado dos arquivos, reconstruível caso seja necessário.
+- Histórico de revisões de conteúdo não faz parte do MVP. Persistir rascunhos em `Draft` atende à necessidade inicial de não perder notas.
+- Linux, macOS e mobile ficam como possibilidades futuras, sem requisito de portabilidade no MVP.
+
+### Próximas etapas
+
+1. Definir critérios de aceitação do fluxo de Draft, organização, navegação e busca.
+2. Fazer um protótipo curto com BlockNote para validar escrita e persistência em Markdown.
+3. Apresentar para aprovação um plano das decisões difíceis de mudar, incluindo formato dos metadados, comportamento dos links em renomeações/movimentações e estrutura do vault além da pasta real `Draft` já acordada.
+4. Implementar o MVP para Windows após validar o protótipo e aprovar o plano arquitetural.
+5. Deixar limpeza/reorganização assistida de Drafts, sugestões automáticas, recursos avançados do editor e outras plataformas para etapas futuras.
+
+### Esclarecimento sobre links e localização — 2026-11-01
+
+- Um link identifica a nota de destino, independentemente da pasta onde ela está salva.
+- A pasta representa a localização física e a organização do arquivo no vault.
+- Mover uma nota entre pastas deve preservar os links existentes para ela.
+- Renomear uma nota também deve preservar o destino dos links; o mecanismo para isso será definido no plano técnico, considerando nomes duplicados e alterações feitas fora do Slate.
+
+## Proposta aprovada: protótipo do fluxo de escrita — 2026-11-01
+
+Objetivo: validar a captura rápida, persistência local em Markdown e organização de notas antes de expandir o app.
+
+1. O usuário escolhe uma pasta para ser o vault; o Slate cria nela a pasta física `Draft`.
+2. Cada abertura do Slate pelo atalho cria uma nota nova em `Draft`, com salvamento local enquanto o usuário escreve.
+3. A interface inicial usa `Draft`, `Menu` e `Search`. O menu apresenta a árvore real de pastas e arquivos; organizar uma nota move o arquivo correspondente no disco.
+4. BlockNote será usado no protótipo com recursos básicos de escrita.
+5. Links `[[Nome da nota]]` devem continuar apontando para a mesma nota depois de uma movimentação. Uma renomeação feita pelo Slate deve manter os links atualizados.
+6. Busca textual será validada inicialmente. Busca combinada com metadados será acrescentada após definição do formato local dos metadados.
+
+Critérios de validação: cada acionamento cria um arquivo novo; rascunhos anteriores permanecem acessíveis; o texto persiste após fechar e reabrir o app; mover arquivos altera a pasta física sem quebrar links; os arquivos permanecem legíveis como Markdown fora do Slate.
+
+Fora desta etapa: histórico de revisões, limpeza/sugestão automática de Drafts, recursos avançados do editor e suporte a outros sistemas operacionais.

@@ -1,0 +1,21 @@
+# Environment and secrets
+.env
+.env.*
+!.env.example
+!.env.template
+
+# JavaScript / Vite
+node_modules/
+dist/
+coverage/
+npm-debug.log*
+
+# Rust / Tauri build output
+target/
+src-tauri/target/
+src-tauri/gen/
+
+# Logs and operating system files
+*.log
+.DS_Store
+Thumbs.db

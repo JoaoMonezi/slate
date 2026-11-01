@@ -1,3 +1,5 @@
+export type Language = "pt-BR" | "en";
+
 export interface VaultEntry {
   name: string;
   relativePath: string;

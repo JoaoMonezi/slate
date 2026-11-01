@@ -1,17 +1,38 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { openPath } from "@tauri-apps/plugin-opener";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { filterSuggestionItems } from "@blocknote/core/extensions";
+import { en, pt } from "@blocknote/core/locales";
 import { BlockNoteView } from "@blocknote/mantine";
 import { getDefaultReactSlashMenuItems, SuggestionMenuController, useCreateBlockNote, useEditorChange } from "@blocknote/react";
-import type { VaultEntry, SearchHit, ActiveNote, GraphData, GraphNode, MovedNote } from "./types";
+import type { VaultEntry, SearchHit, ActiveNote, GraphData, GraphNode, MovedNote, Language } from "./types";
+import { createTranslator, localizeError, type Translator } from "./i18n";
 import "@blocknote/core/fonts/inter.css";
 import "@blocknote/mantine/style.css";
 import "./App.css";
 
 const VAULT_STORAGE_KEY = "slate.vaultPath";
+const LANGUAGE_STORAGE_KEY = "slate.language";
+const FONT_FAMILY_STORAGE_KEY = "slate.fontFamily";
+const FONT_SIZE_STORAGE_KEY = "slate.fontSize";
+type FontFamily = "inter" | "segoe" | "consolas" | "georgia";
+const FONT_FAMILIES: Record<FontFamily, string> = {
+  inter: "Inter, ui-sans-serif, system-ui, sans-serif",
+  segoe: '"Segoe UI", sans-serif',
+  consolas: 'Consolas, "Courier New", monospace',
+  georgia: 'Georgia, "Times New Roman", serif',
+};
+
+function SettingsIcon() {
+  return (
+    <svg viewBox="0 0 20 20" aria-hidden="true">
+      <path d="M8.7 2.7h2.6l.4 1.8c.5.2 1 .5 1.4.8l1.7-.7 1.3 2.2-1.3 1.2c.1.5.1 1.1 0 1.6l1.3 1.2-1.3 2.2-1.7-.7c-.4.3-.9.6-1.4.8l-.4 1.8H8.7l-.4-1.8c-.5-.2-1-.5-1.4-.8l-1.7.7-1.3-2.2 1.3-1.2a5.5 5.5 0 0 1 0-1.6L3.9 6.8l1.3-2.2 1.7.7c.4-.3.9-.6 1.4-.8l.4-1.8Z" />
+      <circle cx="10" cy="8.8" r="2.1" />
+    </svg>
+  );
+}
 
 function TrashIcon() {
   return (
@@ -25,6 +46,8 @@ function NoteEditor({
   pathKey,
   markdown,
   notes,
+  language,
+  t,
   onOpenNoteLink,
   onSave,
   onDraft,
@@ -33,12 +56,14 @@ function NoteEditor({
   pathKey: string;
   markdown: string;
   notes: VaultEntry[];
+  language: Language;
+  t: Translator;
   onOpenNoteLink: (target: string) => void;
   onSave: (value: string, relativePath: string) => void;
   onDraft: (value: string) => void;
   shouldSkipSave: (relativePath: string) => boolean;
 }) {
-  const editor = useCreateBlockNote();
+  const editor = useCreateBlockNote({ dictionary: language === "en" ? en : pt });
   const [linkPickerOpen, setLinkPickerOpen] = useState(false);
   const [linkQuery, setLinkQuery] = useState("");
   const linkSearchRef = useRef<HTMLInputElement>(null);
@@ -101,10 +126,10 @@ function NoteEditor({
   const slashMenuItems = useCallback(async (query: string) => {
     const defaultItems = getDefaultReactSlashMenuItems(editor);
     const linkItem = {
-      title: "Vincular nota",
-      subtext: "Inserir um link para outra nota",
-      aliases: ["link", "nota", "wikilink"],
-      group: "Notas",
+      title: t("linkNote"),
+      subtext: t("insertLinkToNote"),
+      aliases: language === "en" ? ["link", "note", "wikilink"] : ["link", "nota", "wikilink"],
+      group: t("notes"),
       onItemClick: () => {
         (editor.getExtension("suggestionMenu") as { clearQuery: () => void } | undefined)?.clearQuery();
         setLinkQuery("");
@@ -112,7 +137,7 @@ function NoteEditor({
       },
     };
     return filterSuggestionItems([linkItem, ...defaultItems], query);
-  }, [editor]);
+  }, [editor, language, t]);
 
   useEffect(() => {
     if (linkPickerOpen) linkSearchRef.current?.focus();
@@ -132,8 +157,8 @@ function NoteEditor({
   const filteredNotes = notes
     .filter((note) => !normalizedLinkQuery
       || displayNoteName(note.name).toLocaleLowerCase().includes(normalizedLinkQuery)
-      || displayRelativePath(note.relativePath).toLocaleLowerCase().includes(normalizedLinkQuery))
-    .sort((a, b) => a.name.localeCompare(b.name, "pt-BR"));
+      || displayRelativePath(note.relativePath, language).toLocaleLowerCase().includes(normalizedLinkQuery))
+    .sort((a, b) => a.name.localeCompare(b.name, language));
 
   return (
     <div className="editor-shell" onClickCapture={(event) => {
@@ -157,8 +182,8 @@ function NoteEditor({
         }}>
           <section className="link-picker" role="dialog" aria-modal="true" aria-labelledby="link-picker-title">
             <div className="link-picker-heading">
-              <h2 id="link-picker-title">Vincular nota</h2>
-              <button className="icon-button" aria-label="Fechar" onClick={() => setLinkPickerOpen(false)}>×</button>
+            <h2 id="link-picker-title">{t("linkNote")}</h2>
+            <button className="icon-button" aria-label={t("closeLinkPicker")} onClick={() => setLinkPickerOpen(false)}>×</button>
             </div>
             <input
               ref={linkSearchRef}
@@ -169,16 +194,16 @@ function NoteEditor({
                 if (event.key === "Escape") setLinkPickerOpen(false);
                 if (event.key === "Enter" && filteredNotes[0]) insertNoteLink(filteredNotes[0]);
               }}
-              placeholder="Buscar uma nota"
-              aria-label="Buscar nota para vincular"
+              placeholder={t("searchNote")}
+              aria-label={t("searchNoteToLink")}
             />
             <div className="link-picker-list">
               {filteredNotes.length ? filteredNotes.map((note) => (
                 <button className="link-picker-item" key={note.relativePath} onClick={() => insertNoteLink(note)}>
                   <span>{displayNoteName(note.name)}</span>
-                  <small>{displayRelativePath(note.relativePath)}</small>
+                  <small>{displayRelativePath(note.relativePath, language)}</small>
                 </button>
-              )) : <p className="muted-copy">Nenhuma nota encontrada.</p>}
+              )) : <p className="muted-copy">{t("noLinkedNotesFound")}</p>}
             </div>
           </section>
         </div>
@@ -242,24 +267,27 @@ function wikiLinksToMarkdown(markdown: string, notes: VaultEntry[]) {
   });
 }
 
-function displayFolderName(name: string) {
-  return name === "Draft" ? "Rascunhos" : name;
+function displayFolderName(name: string, language: Language = "pt-BR") {
+  return name === "Draft" ? (language === "en" ? "Drafts" : "Rascunhos") : name;
 }
 
 function displayNoteName(name: string) {
   return name.replace(/^Draft-/i, "Rascunho-").replace(/\.md$/i, "");
 }
 
-function displayRelativePath(path: string) {
+function displayRelativePath(path: string, language: Language = "pt-BR") {
   return path.split("/").map((part) => part.toLowerCase().endsWith(".md")
     ? displayNoteName(part)
-    : displayFolderName(part)).join("/");
+    : displayFolderName(part, language)).join("/");
 }
 
 function FolderTree({
   entries,
   selectedFolder,
+  language,
+  t,
   onSelectFolder,
+  onCreateDraft,
   onOpenNote,
   onRenameNote,
   onDeleteNote,
@@ -269,7 +297,10 @@ function FolderTree({
 }: {
   entries: VaultEntry[];
   selectedFolder: string;
+  language: Language;
+  t: Translator;
   onSelectFolder: (path: string) => void;
+  onCreateDraft: () => void;
   onOpenNote: (path: string) => void;
   onRenameNote: (path: string) => void;
   onDeleteNote: (path: string) => void;
@@ -291,7 +322,7 @@ function FolderTree({
             >
               <button
                 className="tree-caret"
-                aria-label={isExpanded ? "Recolher pasta" : "Expandir pasta"}
+                aria-label={isExpanded ? t("collapseFolder") : t("expandFolder")}
                 onClick={() =>
                   setExpanded((current) => {
                     const next = new Set(current);
@@ -309,11 +340,26 @@ function FolderTree({
                   onSelectFolder(node.relativePath);
                   setExpanded((current) => new Set(current).add(node.relativePath));
                 }}
-                title={`Escolher ${displayFolderName(node.name)} como destino da nota`}
+                title={t("chooseFolder", { folder: displayFolderName(node.name, language) })}
               >
                 <span className="tree-icon">▱</span>
-                <span>{displayFolderName(node.name)}</span>
+                <span>{displayFolderName(node.name, language)}</span>
               </button>
+              {node.name.toLocaleLowerCase() === "draft" && (
+                <button
+                  className="tree-create-draft"
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    onSelectFolder(node.relativePath);
+                    setExpanded((current) => new Set(current).add(node.relativePath));
+                    onCreateDraft();
+                  }}
+                  aria-label={t("createDraftInDrafts")}
+                  title={t("newDraft")}
+                >
+                  +
+                </button>
+              )}
             </div>
             {isExpanded && node.children.length > 0 && (
               <div>{renderEntries(node.children, depth + 1)}</div>
@@ -337,13 +383,13 @@ function FolderTree({
             className="tree-note-checkbox"
             checked={selectedNotes.has(node.relativePath)}
             onChange={() => onToggleSelection(node.relativePath)}
-            aria-label={`Selecionar ${displayNoteName(node.name)}`}
+            aria-label={t("selectedAria", { name: displayNoteName(node.name) })}
           />
           <button
             className="tree-row file-row"
             onClick={() => onOpenNote(node.relativePath)}
             onDoubleClick={() => onRenameNote(node.relativePath)}
-            title={displayRelativePath(node.relativePath)}
+            title={displayRelativePath(node.relativePath, language)}
           >
             <span className="tree-icon file-icon">·</span>
             <span className="tree-label">{displayNoteName(node.name)}</span>
@@ -351,8 +397,8 @@ function FolderTree({
           <button
             className="tree-delete-button"
             onClick={() => onDeleteNote(node.relativePath)}
-            aria-label={`Apagar ${displayNoteName(node.name)}`}
-            title="Apagar arquivo"
+            aria-label={t("fileDeletedAria", { name: displayNoteName(node.name) })}
+            title={t("deleteFile")}
           >
             <TrashIcon />
           </button>
@@ -366,10 +412,14 @@ function FolderTree({
 function GraphView({
   data,
   highlightedPaths,
+  language,
+  t,
   onOpenNote,
 }: {
   data: GraphData;
   highlightedPaths: Set<string>;
+  language: Language;
+  t: Translator;
   onOpenNote: (path: string) => void;
 }) {
   const layout = useMemo(() => {
@@ -413,12 +463,18 @@ function GraphView({
   return (
     <div className="graph-view">
       <div className="graph-legend">
-        <span><i className="legend-folder" /> Pastas e notas</span>
-        <span><i className="legend-link" /> Links entre notas</span>
-        <span>{data.nodes.filter((node) => node.kind === "note").length} notas · {data.edges.length} links</span>
+        <span><i className="legend-folder" /> {t("foldersAndNotesLegend")}</span>
+        <span><i className="legend-link" /> {t("noteLinks")}</span>
+        <span>
+          {data.nodes.filter((node) => node.kind === "note").length === 1
+            ? t("noteCount", { count: 1 })
+            : t("notesCount", { count: data.nodes.filter((node) => node.kind === "note").length })}
+          {" · "}
+          {data.edges.length === 1 ? t("linkCount", { count: 1 }) : t("linksCount", { count: data.edges.length })}
+        </span>
       </div>
       <div className="graph-canvas">
-        <svg width={layout.width} height={layout.height} role="img" aria-label="Árvore de pastas e links entre notas">
+        <svg width={layout.width} height={layout.height} role="img" aria-label={t("folderAndNoteGraph")}>
           <defs>
             <marker id="graph-link-arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
               <path d="M 0 0 L 10 5 L 0 10 z" className="graph-arrowhead" />
@@ -450,7 +506,7 @@ function GraphView({
             if (!position) return null;
             const isNote = node.kind === "note";
             const selected = highlightedPaths.has(node.relativePath);
-            const nodeLabel = isNote ? displayNoteName(node.label) : displayFolderName(node.label);
+            const nodeLabel = isNote ? displayNoteName(node.label) : displayFolderName(node.label, language);
             return (
               <g
                 key={node.id}
@@ -460,14 +516,14 @@ function GraphView({
                 onKeyDown={isNote ? (event) => { if (event.key === "Enter" || event.key === " ") onOpenNote(node.relativePath); } : undefined}
                 tabIndex={isNote ? 0 : undefined}
                 role={isNote ? "button" : undefined}
-                aria-label={isNote ? `Abrir nota ${node.label}` : undefined}
+                aria-label={isNote ? `${t("openNote")} ${node.label}` : undefined}
               >
                 <rect width="158" height="35" rx="8" />
                 <text x="12" y="22">{isNote ? "▤" : "▱"}</text>
                 <text x="32" y="22" className="graph-node-label">
                   {nodeLabel.length > 18 ? `${nodeLabel.slice(0, 17)}…` : nodeLabel}
                 </text>
-                <title>{nodeLabel} · {displayRelativePath(node.relativePath) || "Slate"}</title>
+                <title>{nodeLabel} · {displayRelativePath(node.relativePath, language) || "Slate"}</title>
               </g>
             );
           })}
@@ -479,6 +535,16 @@ function GraphView({
 
 function App() {
   const [vaultPath, setVaultPath] = useState(() => localStorage.getItem(VAULT_STORAGE_KEY) ?? "");
+  const [language, setLanguage] = useState<Language>(() => localStorage.getItem(LANGUAGE_STORAGE_KEY) === "en" ? "en" : "pt-BR");
+  const [fontFamily, setFontFamily] = useState<FontFamily>(() => {
+    const stored = localStorage.getItem(FONT_FAMILY_STORAGE_KEY);
+    return stored === "segoe" || stored === "consolas" || stored === "georgia" ? stored : "inter";
+  });
+  const [fontSize, setFontSize] = useState(() => {
+    const stored = localStorage.getItem(FONT_SIZE_STORAGE_KEY);
+    return stored === "14" || stored === "18" || stored === "20" ? stored : "16";
+  });
+  const t = useMemo(() => createTranslator(language), [language]);
   const [openNotes, setOpenNotes] = useState<ActiveNote[]>([]);
   const [activePathKey, setActivePathKey] = useState("");
   const [entries, setEntries] = useState<VaultEntry[]>([]);
@@ -489,6 +555,7 @@ function App() {
   const [searchBusy, setSearchBusy] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
   const [searchOpen, setSearchOpen] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
   const [selectedFolder, setSelectedFolder] = useState("Draft");
   const [newFolderName, setNewFolderName] = useState("");
   const [deleteTargets, setDeleteTargets] = useState<string[]>([]);
@@ -697,7 +764,7 @@ function App() {
     if (activePath.current && vaultPath) {
       await persistNote(vaultPath, activePath.current, currentContent.current).catch(() => undefined);
     }
-    const selected = await open({ directory: true, multiple: false, title: "Escolher pasta de notas" });
+    const selected = await open({ directory: true, multiple: false, title: t("chooseNotesFolder") });
     if (typeof selected !== "string") return;
     localStorage.setItem(VAULT_STORAGE_KEY, selected);
     startupVault.current = "";
@@ -725,7 +792,7 @@ function App() {
       setGraphData(await invoke<GraphData>("get_graph_data", { vaultPath }));
     } catch (cause) {
       if (searchOpen && searchMode === "tree") {
-        setError(`Não foi possível atualizar a árvore: ${String(cause)}`);
+        setError(t("treeUpdateError", { error: String(cause) }));
       }
     }
   }
@@ -962,49 +1029,97 @@ function App() {
     return displayNoteName(note.name);
   }
 
+  async function changeLanguage(nextLanguage: Language) {
+    if (nextLanguage === language) return;
+    if (vaultPath && activePath.current) {
+      try {
+        const notePath = activePath.current;
+        const content = currentContent.current;
+        await persistNote(vaultPath, notePath, content);
+        setOpenNotes((current) => current.map((note) => note.relativePath === notePath ? { ...note, content } : note));
+      } catch (cause) {
+        setError(String(cause));
+        return;
+      }
+    }
+    localStorage.setItem(LANGUAGE_STORAGE_KEY, nextLanguage);
+    setLanguage(nextLanguage);
+  }
+
+  function changeFontFamily(nextFont: FontFamily) {
+    localStorage.setItem(FONT_FAMILY_STORAGE_KEY, nextFont);
+    setFontFamily(nextFont);
+  }
+
+  function changeFontSize(nextSize: string) {
+    localStorage.setItem(FONT_SIZE_STORAGE_KEY, nextSize);
+    setFontSize(nextSize);
+  }
+
   return (
-    <main className="slate-app">
-      <header className={`topbar ${menuOpen || searchOpen ? "with-brand" : ""}`} data-tauri-drag-region>
-        {(menuOpen || searchOpen) && (
+    <main
+      className="slate-app"
+      style={{
+        "--note-font-family": FONT_FAMILIES[fontFamily],
+        "--note-font-size": `${fontSize}px`,
+      } as CSSProperties}
+    >
+      <header className={`topbar ${menuOpen || searchOpen || settingsOpen ? "with-brand" : ""}`} data-tauri-drag-region>
+        {(menuOpen || searchOpen || settingsOpen) && (
           <div className="app-title" data-tauri-drag-region>
             <img className="slate-emblem" src="/slate-mark.svg" alt="" />
             <span>Slate</span>
           </div>
         )}
-        <nav className="topbar-nav" aria-label="Navegação principal">
+        <nav className="topbar-nav" aria-label={t("mainNavigation")}>
           <button
             className={`nav-word ${menuOpen ? "active" : ""}`}
             onClick={() => {
               setMenuOpen((value) => !value);
               setSearchOpen(false);
+              setSettingsOpen(false);
             }}
           >
-            Menu
+            {t("menu")}
           </button>
           <button
             className={`nav-word ${searchOpen ? "active" : ""}`}
             onClick={() => {
               setSearchOpen((value) => !value);
               setMenuOpen(false);
+              setSettingsOpen(false);
             }}
           >
-            Buscar
+            {t("search")}
+          </button>
+          <button
+            className={`settings-nav-button ${settingsOpen ? "active" : ""}`}
+            onClick={() => {
+              setSettingsOpen((value) => !value);
+              setMenuOpen(false);
+              setSearchOpen(false);
+            }}
+            aria-label={t("settings")}
+            title={t("settings")}
+            aria-pressed={settingsOpen}
+          >
+            <SettingsIcon />
           </button>
         </nav>
-        <div className="window-controls" aria-label="Controles da janela">
-          <button onClick={() => void getCurrentWindow().minimize()} aria-label="Minimizar janela" title="Minimizar">
+        <div className="window-controls" aria-label={t("windowControls")}>
+          <button onClick={() => void getCurrentWindow().minimize()} aria-label={t("minimize")} title={t("minimize")}>
             −
           </button>
-          <button onClick={() => void getCurrentWindow().toggleMaximize()} aria-label="Maximizar janela" title="Maximizar ou restaurar">
+          <button onClick={() => void getCurrentWindow().toggleMaximize()} aria-label={t("maximize")} title={t("maximize")}>
             □
           </button>
-          <button className="window-close" onClick={() => void getCurrentWindow().close()} aria-label="Fechar janela" title="Fechar">
+          <button className="window-close" onClick={() => void getCurrentWindow().close()} aria-label={t("close")} title={t("close")}>
             ×
           </button>
         </div>
       </header>
 
-      <div className="tab-strip" role="tablist" aria-label="Anotações abertas">
+      <div className="tab-strip" role="tablist" aria-label={t("openNotes")}>
           {openNotes.map((note) => (
             <div
               className={`note-tab ${activePathKey === note.relativePath ? "active" : ""}`}
@@ -1020,7 +1135,7 @@ function App() {
                 aria-selected={activePathKey === note.relativePath}
                 onClick={() => void loadNote(note.relativePath)}
                 onDoubleClick={() => startRenameNote(note.relativePath)}
-                title={displayRelativePath(note.relativePath)}
+                title={displayRelativePath(note.relativePath, language)}
               >
                 {tabLabel(note)}
               </button>
@@ -1028,21 +1143,21 @@ function App() {
                 className="note-tab-close"
                 onClick={() => void closeNoteTab(note.relativePath)}
                 aria-label={`Fechar ${tabLabel(note)}`}
-                title="Fechar aba; a nota continua salva"
+                title={t("closeTab")}
               >
                 ×
               </button>
               <button
                 className="note-tab-delete"
                 onClick={() => setDeleteTargets([note.relativePath])}
-                aria-label={`Apagar arquivo ${tabLabel(note)}`}
-                title="Apagar arquivo"
+                aria-label={t("fileDeletedAria", { name: tabLabel(note) })}
+                title={t("deleteFile")}
               >
                 <TrashIcon />
               </button>
             </div>
           ))}
-          <button className="new-tab-button" onClick={() => void createDraft()} aria-label="Criar novo rascunho" title="Novo rascunho">
+          <button className="new-tab-button" onClick={() => void createDraft()} aria-label={t("createDraft")} title={t("newDraft")}>
             +
           </button>
       </div>
@@ -1051,10 +1166,10 @@ function App() {
           <aside className="side-panel">
             <div className="panel-heading">
               <div>
-                <p className="eyebrow">Navegar</p>
-                <h2>Pastas e notas</h2>
+                <p className="eyebrow">{t("navigate")}</p>
+                <h2>{t("foldersAndNotes")}</h2>
               </div>
-              <button className="icon-button" onClick={() => setMenuOpen(false)} aria-label="Fechar menu">
+              <button className="icon-button" onClick={() => setMenuOpen(false)} aria-label={t("closeMenu")}>
                 ×
               </button>
             </div>
@@ -1062,20 +1177,23 @@ function App() {
               <input
                 value={newFolderName}
                 onChange={(event) => setNewFolderName(event.currentTarget.value)}
-                placeholder="Nova pasta"
-                aria-label="Nome da nova pasta"
+                placeholder={t("newFolder")}
+                aria-label={t("folderName")}
                 onKeyDown={(event) => {
                   if (event.key === "Enter") void addFolder();
                 }}
               />
               <button className="small-button" onClick={() => void addFolder()} disabled={!newFolderName.trim()}>
-                Criar
+                {t("create")}
               </button>
             </div>
             <FolderTree
               entries={entries}
               selectedFolder={selectedFolder}
+              language={language}
+              t={t}
               onSelectFolder={setSelectedFolder}
+              onCreateDraft={() => void createDraft()}
               onOpenNote={(path) => void loadNote(path)}
               onRenameNote={startRenameNote}
               onDeleteNote={(path) => setDeleteTargets([path])}
@@ -1086,9 +1204,9 @@ function App() {
             {selectedNotePaths.size > 0 && (
               <div className="selection-actions">
                 <span className="selection-count">
-                  {selectedNotePaths.size} {selectedNotePaths.size === 1 ? "nota selecionada" : "notas selecionadas"}
+                  {selectedNotePaths.size} {selectedNotePaths.size === 1 ? t("selectedNote") : t("selectedNotes")}
                 </span>
-                <label className="selection-destination-label" htmlFor="selection-destination">Destino</label>
+                <label className="selection-destination-label" htmlFor="selection-destination">{t("destination")}</label>
                 <select
                   id="selection-destination"
                   className="folder-select selection-destination"
@@ -1097,21 +1215,21 @@ function App() {
                 >
                   {folders.map((folder) => (
                     <option value={folder.relativePath} key={folder.relativePath}>
-                      {displayRelativePath(folder.relativePath)}
+                      {displayRelativePath(folder.relativePath, language)}
                     </option>
                   ))}
                 </select>
                 <div className="selection-action-buttons">
-                  <button onClick={() => void moveSelectedNotes()} disabled={!canMoveSelected}>Mover</button>
-                  <button onClick={() => void copySelectedNotes()}>Copiar</button>
-                  <button onClick={() => setDeleteTargets([...selectedNotePaths])}>Apagar</button>
-                  <button className="clear-selection-button" onClick={() => setSelectedNotePaths(new Set())}>Limpar</button>
+                  <button onClick={() => void moveSelectedNotes()} disabled={!canMoveSelected}>{t("move")}</button>
+                  <button onClick={() => void copySelectedNotes()}>{t("copy")}</button>
+                  <button onClick={() => setDeleteTargets([...selectedNotePaths])}>{t("delete")}</button>
+                  <button className="clear-selection-button" onClick={() => setSelectedNotePaths(new Set())}>{t("clear")}</button>
                 </div>
               </div>
             )}
             {activeNote && selectedNotePaths.size === 0 && (
               <div className="organize-box">
-                <label className="organize-label" htmlFor="organize-target">Mover nota para</label>
+                <label className="organize-label" htmlFor="organize-target">{t("moveNoteTo")}</label>
                 <select
                   id="organize-target"
                   className="folder-select"
@@ -1120,25 +1238,72 @@ function App() {
                 >
               {folders.map((folder) => (
                     <option value={folder.relativePath} key={folder.relativePath}>
-                      {displayRelativePath(folder.relativePath)}
+                    {displayRelativePath(folder.relativePath, language)}
                     </option>
                   ))}
                 </select>
                 {selectedFolder !== "Draft" && selectedFolder !== activeNote.relativePath.split("/").slice(0, -1).join("/") && (
                   <button className="primary-button" onClick={() => void organizeNote()}>
-                    Organizar nota
+                    {t("organizeNote")}
                   </button>
                 )}
               </div>
             )}
             <div className="folder-actions">
-              <p className="eyebrow">Pasta de notas</p>
+              <p className="eyebrow">{t("notesFolder")}</p>
               <button className="folder-action-button" onClick={() => void showNotesFolder()}>
-                Abrir no Explorador
+                {t("openInExplorer")}
               </button>
               <button className="folder-action-button" onClick={() => void chooseVault()}>
-                Trocar pasta
+                {t("changeFolder")}
               </button>
+            </div>
+          </aside>
+        )}
+
+        {settingsOpen && (
+          <aside className="side-panel settings-panel">
+            <div className="panel-heading">
+              <div>
+                <p className="eyebrow">{t("settingsDescription")}</p>
+                <h2>{t("settings")}</h2>
+              </div>
+              <button className="icon-button" onClick={() => setSettingsOpen(false)} aria-label={t("closeSettings")}>
+                ×
+              </button>
+            </div>
+            <div className="settings-content">
+              <label htmlFor="language-setting">{t("language")}</label>
+              <select
+                id="language-setting"
+                className="folder-select language-select"
+                value={language}
+                onChange={(event) => void changeLanguage(event.currentTarget.value as Language)}
+              >
+                <option value="pt-BR">{t("portuguese")}</option>
+                <option value="en">{t("english")}</option>
+              </select>
+              <label htmlFor="font-setting">{t("font")}</label>
+              <select
+                id="font-setting"
+                className="folder-select language-select"
+                value={fontFamily}
+                onChange={(event) => changeFontFamily(event.currentTarget.value as FontFamily)}
+              >
+                <option value="inter">{t("slateFont")}</option>
+                <option value="segoe">{t("segoeFont")}</option>
+                <option value="consolas">{t("monoFont")}</option>
+                <option value="georgia">{t("serifFont")}</option>
+              </select>
+              <label htmlFor="font-size-setting">{t("fontSize")}</label>
+              <select
+                id="font-size-setting"
+                className="folder-select language-select"
+                value={fontSize}
+                onChange={(event) => changeFontSize(event.currentTarget.value)}
+              >
+                {[14, 16, 18, 20].map((size) => <option key={size} value={size}>{size} px</option>)}
+              </select>
             </div>
           </aside>
         )}
@@ -1147,10 +1312,10 @@ function App() {
           <aside className={`side-panel search-panel ${searchMode === "tree" ? "graph-search-panel" : ""}`}>
             <div className="panel-heading">
               <div>
-                <p className="eyebrow">Encontrar</p>
-                <h2>Buscar</h2>
+                <p className="eyebrow">{t("find")}</p>
+                <h2>{t("searchPanelTitle")}</h2>
               </div>
-              <button className="icon-button" onClick={() => setSearchOpen(false)} aria-label="Fechar busca">
+              <button className="icon-button" onClick={() => setSearchOpen(false)} aria-label={t("closeSearch")}>
                 ×
               </button>
             </div>
@@ -1159,16 +1324,16 @@ function App() {
               autoFocus
               value={searchQuery}
               onChange={(event) => setSearchQuery(event.currentTarget.value)}
-              placeholder="Buscar notas..."
+              placeholder={t("searchNotes")}
             />
-            <div className="search-mode-switch" role="tablist" aria-label="Modo de visualização">
+            <div className="search-mode-switch" role="tablist" aria-label={t("viewMode")}>
               <button
                 className={`search-mode-button ${searchMode === "results" ? "active" : ""}`}
                 role="tab"
                 aria-selected={searchMode === "results"}
                 onClick={() => setSearchMode("results")}
               >
-                Resultados
+                {t("results")}
               </button>
               <button
                 className={`search-mode-button ${searchMode === "tree" ? "active" : ""}`}
@@ -1176,19 +1341,19 @@ function App() {
                 aria-selected={searchMode === "tree"}
                 onClick={() => setSearchMode("tree")}
               >
-                Árvore
+                {t("tree")}
               </button>
             </div>
             {searchMode === "results" ? (
               <div className="search-results">
-                {searchBusy && <p className="muted-copy">Buscando...</p>}
+                {searchBusy && <p className="muted-copy">{t("searching")}</p>}
                 {!searchBusy && searchQuery.trim() && searchHits.length === 0 && (
-                  <p className="muted-copy">Nenhuma nota encontrada.</p>
+                  <p className="muted-copy">{t("noNotesFound")}</p>
                 )}
                 {searchHits.map((hit) => (
                   <button className="search-hit" key={hit.relativePath} onClick={() => void loadNote(hit.relativePath)}>
                     <span className="search-hit-title">{displayNoteName(hit.name)}</span>
-                    <span className="search-hit-path">{displayRelativePath(hit.relativePath)}</span>
+                    <span className="search-hit-path">{displayRelativePath(hit.relativePath, language)}</span>
                     <span className="search-hit-excerpt">{hit.excerpt}</span>
                   </button>
                 ))}
@@ -1197,6 +1362,8 @@ function App() {
               <GraphView
                 data={graphData}
                 highlightedPaths={new Set(searchHits.map((hit) => hit.relativePath))}
+                language={language}
+                t={t}
                 onOpenNote={(path) => void loadNote(path)}
               />
             )}
@@ -1207,13 +1374,16 @@ function App() {
           {activeNote ? (
             <>
               <NoteEditor
+                key={language}
                 pathKey={activeNote.relativePath}
                 markdown={activeNote.content}
                 notes={noteEntries}
+                language={language}
+                t={t}
                 onOpenNoteLink={(target) => {
                   const targetNote = resolveNoteEntry(target, noteEntries);
                   if (targetNote) void loadNote(targetNote.relativePath);
-                  else setError(`A nota vinculada não foi encontrada: ${target}`);
+                  else setError(t("linkNotFound", { target }));
                 }}
                 onSave={(content, path) => void saveMarkdown(path, content)}
                 shouldSkipSave={(path) => blockedSavePaths.current.has(path)}
@@ -1226,20 +1396,20 @@ function App() {
             <div className="empty-state">
               {error ? (
                 <>
-                  <p>Não foi possível abrir seu rascunho.</p>
+                  <p>{t("couldNotOpenDraft")}</p>
                   <button className="primary-button" onClick={() => void initializeDefaultVault()}>
-                    Tentar novamente
+                    {t("tryAgain")}
                   </button>
                 </>
               ) : (
-                <p>{loading ? "Preparando seu rascunho..." : "Abrindo seu rascunho..."}</p>
+                <p>{loading ? t("preparingDraft") : t("openingDraft")}</p>
               )}
             </div>
           )}
           {error && (
             <div className="toast-error" role="alert">
-              <span>{error}</span>
-              <button className="icon-button" onClick={() => setError("")} aria-label="Fechar erro">×</button>
+              <span>{localizeError(error, language)}</span>
+              <button className="icon-button" onClick={() => setError("")} aria-label={t("errorClose")}>×</button>
             </div>
           )}
         </section>
@@ -1253,7 +1423,7 @@ function App() {
         >
           <button role="menuitem" onClick={() => startRenameNote(noteContextMenu.path)}>
             <span className="rename-menu-icon" aria-hidden="true">✎</span>
-            Renomear
+            {t("rename")}
           </button>
           <button
             role="menuitem"
@@ -1267,8 +1437,8 @@ function App() {
           >
             <TrashIcon />
             {selectedNotePaths.has(noteContextMenu.path) && selectedNotePaths.size > 1
-              ? `Apagar ${selectedNotePaths.size} arquivos selecionados`
-              : "Apagar arquivo"}
+              ? t("deleteSelectedFiles", { count: selectedNotePaths.size })
+              : t("deleteFile")}
           </button>
         </div>
       )}
@@ -1280,8 +1450,8 @@ function App() {
           }}
         >
           <section className="rename-dialog" role="dialog" aria-modal="true" aria-labelledby="rename-title">
-            <h2 id="rename-title">Renomear nota</h2>
-            <p>O arquivo será renomeado na pasta atual.</p>
+            <h2 id="rename-title">{t("renameNote")}</h2>
+            <p>{t("noteRenamedInCurrentFolder")}</p>
             <input
               autoFocus
               value={renameName}
@@ -1290,16 +1460,16 @@ function App() {
                 if (event.key === "Enter") void confirmRenameNote();
                 if (event.key === "Escape" && !renamingNote) setRenameTarget(null);
               }}
-              aria-label="Novo nome da nota"
-              placeholder="Nome da nota"
+              aria-label={t("newNoteName")}
+              placeholder={t("noteName")}
               disabled={renamingNote}
             />
             <div className="rename-dialog-actions">
               <button className="cancel-button" onClick={() => setRenameTarget(null)} disabled={renamingNote}>
-                Cancelar
+                {t("cancel")}
               </button>
               <button className="primary-button" onClick={() => void confirmRenameNote()} disabled={renamingNote || !renameName.trim()}>
-                {renamingNote ? "Renomeando…" : "Renomear"}
+                {renamingNote ? t("renaming") : t("rename")}
               </button>
             </div>
           </section>
@@ -1314,25 +1484,25 @@ function App() {
         >
           <section className="delete-dialog" role="alertdialog" aria-modal="true" aria-labelledby="delete-title">
             <h2 id="delete-title">
-              {deleteTargets.length === 1 ? "Apagar arquivo?" : `Apagar ${deleteTargets.length} arquivos?`}
+              {deleteTargets.length === 1 ? t("deleteFileQuestion") : t("deleteFilesQuestion", { count: deleteTargets.length })}
             </h2>
             {deleteTargets.length === 1 ? (
-              <p><strong>{deleteTargetNames[0]}</strong> será apagado da pasta de notas. Esta ação não pode ser desfeita.</p>
+              <p>{t("fileWillBeDeleted", { name: deleteTargetNames[0] })}</p>
             ) : (
               <>
-                <p>Estes arquivos serão apagados da pasta de notas. Esta ação não pode ser desfeita.</p>
+                <p>{t("filesWillBeDeleted")}</p>
                 <ul className="delete-target-list">
                   {deleteTargetNames.slice(0, 8).map((name, index) => <li key={deleteTargets[index]}>{name}</li>)}
-                  {deleteTargetNames.length > 8 && <li>e mais {deleteTargetNames.length - 8}</li>}
+                  {deleteTargetNames.length > 8 && <li>{t("andMore", { count: deleteTargetNames.length - 8 })}</li>}
                 </ul>
               </>
             )}
             <div className="delete-dialog-actions">
               <button className="cancel-button" onClick={() => setDeleteTargets([])} disabled={deletingNote}>
-                Cancelar
+                {t("cancel")}
               </button>
               <button className="delete-confirm-button" onClick={() => void confirmDeleteNote()} disabled={deletingNote}>
-                {deletingNote ? "Apagando…" : deleteTargets.length === 1 ? "Apagar arquivo" : `Apagar ${deleteTargets.length} arquivos`}
+                {deletingNote ? t("deleting") : deleteTargets.length === 1 ? t("deleteFile") : t("deleteFiles", { count: deleteTargets.length })}
               </button>
             </div>
           </section>

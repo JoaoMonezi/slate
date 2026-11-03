@@ -1015,10 +1015,19 @@ fn save_note(
     let current_markdown = fs::read_to_string(&path)
         .map_err(|error| format!("Não foi possível conferir a versão atual da nota: {error}"))?;
     let metadata = read_block_metadata(&root, &relative_path)?;
-    let has_conflict = current_markdown != expected_markdown_snapshot
-        || metadata
-            .as_ref()
-            .is_some_and(|existing| existing.markdown_snapshot != current_markdown);
+    let markdown_changed_since_load = current_markdown != expected_markdown_snapshot;
+    let metadata_snapshot_mismatch = metadata
+        .as_ref()
+        .is_some_and(|existing| existing.markdown_snapshot != current_markdown);
+    log::debug!(
+        "[save.conflict-check] path={} markdownChanged={} metadataMismatch={} diskChars={} expectedChars={}",
+        relative_path,
+        markdown_changed_since_load,
+        metadata_snapshot_mismatch,
+        current_markdown.len(),
+        expected_markdown_snapshot.len()
+    );
+    let has_conflict = markdown_changed_since_load || metadata_snapshot_mismatch;
     if has_conflict {
         if conflict_resolution == "none" {
             return Err("A nota foi alterada fora do Slate desde a última abertura. Revise o aviso na nota antes de salvar.".to_string());

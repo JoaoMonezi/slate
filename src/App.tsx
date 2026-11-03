@@ -642,7 +642,7 @@ function App() {
   const activePath = useRef("");
   const currentContent = useRef("");
   const currentBlockDocumentJson = useRef("");
-  const openedMarkdownSnapshot = useRef("");
+  const persistedMarkdownByPath = useRef(new Map<string, string>());
   const saveQueue = useRef<Promise<void>>(Promise.resolve());
   const saveRequestId = useRef(0);
   const closingWindow = useRef(false);
@@ -669,14 +669,16 @@ function App() {
     conflictResolution: "none" | "use-current-markdown" | "restore-slate" = "none",
   ) => {
     const requestId = ++saveRequestId.current;
-    const expectedMarkdownSnapshot = openedMarkdownSnapshot.current;
-    if (activePath.current === relativePath) openedMarkdownSnapshot.current = content;
     setSaveStatus("saving");
     void logDebug(`[save.start] path=${relativePath} chars=${content.length} jsonChars=${blockDocumentJson.length}`).catch(() => undefined);
     const pending = saveQueue.current
       .catch(() => undefined)
       .then(async () => {
         try {
+          const expectedMarkdownSnapshot = persistedMarkdownByPath.current.get(relativePath);
+          if (expectedMarkdownSnapshot === undefined) {
+            throw new Error(`Não foi possível validar a versão carregada de ${relativePath}. Reabra a nota antes de salvar.`);
+          }
           await invoke<void>("save_note", {
             vaultPath: path,
             relativePath,
@@ -685,6 +687,16 @@ function App() {
             expectedMarkdownSnapshot,
             conflictResolution,
           });
+          persistedMarkdownByPath.current.set(relativePath, content);
+          setOpenNotes((current) => current.map((note) => note.relativePath === relativePath
+            ? {
+                ...note,
+                content,
+                blockDocumentJson,
+                blockDocumentMarkdownSnapshot: content,
+                blockDocumentConflict: false,
+              }
+            : note));
           void logInfo(`[save.ok] path=${relativePath} chars=${content.length}`).catch(() => undefined);
           if (requestId === saveRequestId.current) setSaveStatus("saved");
         } catch (cause) {
@@ -756,7 +768,7 @@ function App() {
     activePath.current = note.relativePath;
     currentContent.current = note.content;
     currentBlockDocumentJson.current = note.blockDocumentJson ?? "";
-    openedMarkdownSnapshot.current = note.content;
+    persistedMarkdownByPath.current.set(note.relativePath, note.content);
     setMenuOpen(false);
     setSearchOpen(false);
   }, []);
@@ -931,7 +943,7 @@ function App() {
     activePath.current = "";
     currentContent.current = "";
     currentBlockDocumentJson.current = "";
-    openedMarkdownSnapshot.current = "";
+    persistedMarkdownByPath.current.clear();
     setError("");
   }
 
@@ -994,7 +1006,8 @@ function App() {
       activePath.current = moved.relativePath;
       currentContent.current = moved.content;
       currentBlockDocumentJson.current = moved.blockDocumentJson ?? currentBlockDocumentJson.current;
-      openedMarkdownSnapshot.current = moved.content;
+      persistedMarkdownByPath.current.delete(sourcePath);
+      persistedMarkdownByPath.current.set(moved.relativePath, moved.content);
       setSelectedFolder("Draft");
       setMenuOpen(false);
     } catch (cause) {
@@ -1031,6 +1044,10 @@ function App() {
         destinationRelativePath: selectedFolder,
       });
       const movedBySource = new Map(moved.map((item) => [item.sourceRelativePath, item.note]));
+      for (const item of moved) {
+        persistedMarkdownByPath.current.delete(item.sourceRelativePath);
+        persistedMarkdownByPath.current.set(item.note.relativePath, item.note.content);
+      }
       setOpenNotes((current) => current.map((note) => movedBySource.get(note.relativePath) ?? note));
       const movedActive = movedBySource.get(activePath.current);
       if (movedActive) {
@@ -1038,7 +1055,6 @@ function App() {
         activePath.current = movedActive.relativePath;
         currentContent.current = movedActive.content;
         currentBlockDocumentJson.current = movedActive.blockDocumentJson ?? currentBlockDocumentJson.current;
-        openedMarkdownSnapshot.current = movedActive.content;
       }
       await refreshTree(vaultPath);
       setSelectedNotePaths(new Set());
@@ -1087,13 +1103,11 @@ function App() {
         activePath.current = next.relativePath;
         currentContent.current = next.content;
         currentBlockDocumentJson.current = next.blockDocumentJson ?? "";
-        openedMarkdownSnapshot.current = next.content;
       } else {
         setActivePathKey("");
         activePath.current = "";
         currentContent.current = "";
         currentBlockDocumentJson.current = "";
-        openedMarkdownSnapshot.current = "";
       }
     }
   }
@@ -1153,8 +1167,9 @@ function App() {
         activePath.current = renamed.relativePath;
         currentContent.current = renamed.content;
         currentBlockDocumentJson.current = renamed.blockDocumentJson ?? currentBlockDocumentJson.current;
-        openedMarkdownSnapshot.current = renamed.content;
       }
+      persistedMarkdownByPath.current.delete(sourcePath);
+      persistedMarkdownByPath.current.set(renamed.relativePath, renamed.content);
       setRenameTarget(null);
     } catch (cause) {
       if (wasActive) blockedSavePaths.current.delete(sourcePath);
@@ -1167,6 +1182,7 @@ function App() {
   async function confirmDeleteNote() {
     if (deleteTargets.length === 0 || !vaultPath || deletingNote) return;
     const paths = [...deleteTargets];
+    for (const path of paths) persistedMarkdownByPath.current.delete(path);
     const pathSet = new Set(paths);
     const activeIndex = openNotes.findIndex((note) => note.relativePath === activePathKey);
     const activeWillBeDeleted = pathSet.has(activePathKey);
@@ -1187,13 +1203,11 @@ function App() {
           activePath.current = next.relativePath;
           currentContent.current = next.content;
           currentBlockDocumentJson.current = next.blockDocumentJson ?? "";
-          openedMarkdownSnapshot.current = next.content;
         } else {
           setActivePathKey("");
           activePath.current = "";
           currentContent.current = "";
           currentBlockDocumentJson.current = "";
-          openedMarkdownSnapshot.current = "";
         }
       }
       await refreshTree(vaultPath);

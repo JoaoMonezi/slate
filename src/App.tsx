@@ -723,7 +723,10 @@ function App() {
     let disposed = false;
     let unlisten: (() => void) | undefined;
     void getCurrentWindow().onCloseRequested(async (event) => {
-      if (closingWindow.current) return;
+      if (closingWindow.current) {
+        event.preventDefault();
+        return;
+      }
       event.preventDefault();
       closingWindow.current = true;
       try {
@@ -732,7 +735,7 @@ function App() {
           await persistNote(vaultPath, notePath, currentContent.current);
         }
         void logInfo("[app.close] note flush completed").catch(() => undefined);
-        await getCurrentWindow().close();
+        await getCurrentWindow().destroy();
       } catch (cause) {
         closingWindow.current = false;
         setSaveStatus("error");

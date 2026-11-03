@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { openPath } from "@tauri-apps/plugin-opener";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { debug as logDebug, error as logError, info as logInfo } from "@tauri-apps/plugin-log";
 import { filterSuggestionItems } from "@blocknote/core/extensions";
 import { en, pt } from "@blocknote/core/locales";
 import { BlockNoteView } from "@blocknote/mantine";
@@ -41,6 +42,8 @@ function TrashIcon() {
     </svg>
   );
 }
+
+type SaveStatus = "saving" | "saved" | "error";
 
 function NoteEditor({
   pathKey,
@@ -90,6 +93,7 @@ function NoteEditor({
     hydrated.current = false;
     const migratedMarkdown = wikiLinksToMarkdown(markdown, notesRef.current);
     const blocks = editor.tryParseMarkdownToBlocks(migratedMarkdown);
+    void logDebug(`[editor.load] path=${pathKey} blocks=${blocks.length} types=${[...new Set(blocks.map((block) => block.type))].join(",")} markdownChars=${migratedMarkdown.length}`).catch(() => undefined);
     editor.replaceBlocks(editor.document, blocks);
     pendingMarkdown.current = migratedMarkdown === markdown ? markdown : editor.blocksToMarkdownLossy();
     hydrated.current = true;
@@ -107,8 +111,11 @@ function NoteEditor({
     pendingMarkdown.current = editor.blocksToMarkdownLossy();
     pendingPath.current = pathRef.current;
     draftRef.current(pendingMarkdown.current);
+    const blockTypes = [...new Set(editor.document.map((block) => block.type))].join(",");
+    const markdownChars = pendingMarkdown.current.length;
     if (timer.current !== undefined) window.clearTimeout(timer.current);
     timer.current = window.setTimeout(() => {
+      void logDebug(`[editor.serialize] path=${pendingPath.current} blockTypes=${blockTypes} markdownChars=${markdownChars}`).catch(() => undefined);
       saveRef.current(pendingMarkdown.current, pendingPath.current);
     }, 350);
   }, editor);
@@ -566,12 +573,15 @@ function App() {
   const [renameName, setRenameName] = useState("");
   const [renamingNote, setRenamingNote] = useState(false);
   const [error, setError] = useState("");
+  const [saveStatus, setSaveStatus] = useState<SaveStatus>("saved");
   const [loading, setLoading] = useState(false);
   const startupVault = useRef("");
   const initializingVault = useRef(false);
   const activePath = useRef("");
   const currentContent = useRef("");
   const saveQueue = useRef<Promise<void>>(Promise.resolve());
+  const saveRequestId = useRef(0);
+  const closingWindow = useRef(false);
   const blockedSavePaths = useRef(new Set<string>());
 
   const activeNote = openNotes.find((note) => note.relativePath === activePathKey) ?? null;
@@ -588,12 +598,72 @@ function App() {
   }, []);
 
   const persistNote = useCallback((path: string, relativePath: string, content: string) => {
+    const requestId = ++saveRequestId.current;
+    setSaveStatus("saving");
+    void logDebug(`[save.start] path=${relativePath} chars=${content.length}`).catch(() => undefined);
     const pending = saveQueue.current
       .catch(() => undefined)
-      .then(() => invoke<void>("save_note", { vaultPath: path, relativePath, content }));
+      .then(async () => {
+        try {
+          await invoke<void>("save_note", { vaultPath: path, relativePath, content });
+          void logInfo(`[save.ok] path=${relativePath} chars=${content.length}`).catch(() => undefined);
+          if (requestId === saveRequestId.current) setSaveStatus("saved");
+        } catch (cause) {
+          void logError(`[save.error] path=${relativePath} error=${String(cause)}`).catch(() => undefined);
+          if (requestId === saveRequestId.current) setSaveStatus("error");
+          throw cause;
+        }
+      });
     saveQueue.current = pending;
     return pending;
   }, []);
+
+  useEffect(() => {
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    void getCurrentWindow().onCloseRequested(async (event) => {
+      if (closingWindow.current) return;
+      event.preventDefault();
+      closingWindow.current = true;
+      try {
+        const notePath = activePath.current;
+        if (vaultPath && notePath) {
+          await persistNote(vaultPath, notePath, currentContent.current);
+        }
+        void logInfo("[app.close] note flush completed").catch(() => undefined);
+        await getCurrentWindow().close();
+      } catch (cause) {
+        closingWindow.current = false;
+        setSaveStatus("error");
+        setError(String(cause));
+        void logError(`[app.close.error] ${String(cause)}`).catch(() => undefined);
+      }
+    }).then((stopListening) => {
+      if (disposed) stopListening();
+      else unlisten = stopListening;
+    }).catch((cause) => {
+      void logError(`[app.close-handler.error] ${String(cause)}`).catch(() => undefined);
+    });
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, [persistNote, vaultPath]);
+
+  useEffect(() => {
+    const saveOnShortcut = (event: KeyboardEvent) => {
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "s") {
+        event.preventDefault();
+        const notePath = activePath.current;
+        if (!vaultPath || !notePath) return;
+        void persistNote(vaultPath, notePath, currentContent.current)
+          .then(() => logInfo(`[save.manual] path=${notePath}`).catch(() => undefined))
+          .catch((cause) => setError(String(cause)));
+      }
+    };
+    window.addEventListener("keydown", saveOnShortcut);
+    return () => window.removeEventListener("keydown", saveOnShortcut);
+  }, [persistNote, vaultPath]);
 
   const selectNoteTab = useCallback((note: ActiveNote) => {
     blockedSavePaths.current.delete(note.relativePath);
@@ -762,7 +832,12 @@ function App() {
 
   async function chooseVault() {
     if (activePath.current && vaultPath) {
-      await persistNote(vaultPath, activePath.current, currentContent.current).catch(() => undefined);
+      try {
+        await persistNote(vaultPath, activePath.current, currentContent.current);
+      } catch (cause) {
+        setError(String(cause));
+        return;
+      }
     }
     const selected = await open({ directory: true, multiple: false, title: t("chooseNotesFolder") });
     if (typeof selected !== "string") return;
@@ -894,7 +969,12 @@ function App() {
     const closingIndex = openNotes.findIndex((note) => note.relativePath === relativePath);
     if (closingIndex < 0) return;
     if (relativePath === activePath.current && vaultPath) {
-      await persistNote(vaultPath, relativePath, currentContent.current).catch((cause) => setError(String(cause)));
+      try {
+        await persistNote(vaultPath, relativePath, currentContent.current);
+      } catch (cause) {
+        setError(String(cause));
+        return;
+      }
     }
     const remaining = openNotes.filter((note) => note.relativePath !== relativePath);
     setOpenNotes(remaining);
@@ -1106,6 +1186,9 @@ function App() {
             <SettingsIcon />
           </button>
         </nav>
+        <span className={`save-status ${saveStatus}`} role="status" aria-live="polite">
+          {t(saveStatus === "saving" ? "saveStatusSaving" : saveStatus === "error" ? "saveStatusError" : "saveStatusSaved")}
+        </span>
         <div className="window-controls" aria-label={t("windowControls")}>
           <button onClick={() => void getCurrentWindow().minimize()} aria-label={t("minimize")} title={t("minimize")}>
             −
@@ -1386,9 +1469,10 @@ function App() {
                   else setError(t("linkNotFound", { target }));
                 }}
                 onSave={(content, path) => void saveMarkdown(path, content)}
-                shouldSkipSave={(path) => blockedSavePaths.current.has(path)}
+                shouldSkipSave={(path) => closingWindow.current || blockedSavePaths.current.has(path)}
                 onDraft={(content) => {
                   currentContent.current = content;
+                  setSaveStatus("saving");
                 }}
               />
             </>

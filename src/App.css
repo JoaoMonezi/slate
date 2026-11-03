@@ -140,6 +140,23 @@
   -webkit-app-region: no-drag;
 }
 
+.save-status {
+  position: absolute;
+  top: 0;
+  right: 148px;
+  display: flex;
+  align-items: center;
+  height: 44px;
+  color: #777777;
+  font-size: 10px;
+  white-space: nowrap;
+  -webkit-app-region: no-drag;
+}
+
+.save-status.error {
+  color: #a63b32;
+}
+
 .window-controls button {
   width: 46px;
   height: 44px;

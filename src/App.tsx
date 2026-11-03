@@ -48,39 +48,52 @@ type SaveStatus = "saving" | "saved" | "error";
 function NoteEditor({
   pathKey,
   markdown,
+  blockDocumentJson,
+  blockDocumentConflict = false,
+  blockDocumentMarkdownSnapshot,
   notes,
   language,
   t,
   onOpenNoteLink,
   onSave,
+  onResolveConflict,
   onDraft,
   shouldSkipSave,
 }: {
   pathKey: string;
   markdown: string;
+  blockDocumentJson?: string | null;
+  blockDocumentConflict?: boolean;
+  blockDocumentMarkdownSnapshot?: string | null;
   notes: VaultEntry[];
   language: Language;
   t: Translator;
   onOpenNoteLink: (target: string) => void;
-  onSave: (value: string, relativePath: string) => void;
-  onDraft: (value: string) => void;
+  onSave: (value: string, relativePath: string, blockDocumentJson: string) => void;
+  onResolveConflict: (value: string, relativePath: string, blockDocumentJson: string, resolution: "use-current-markdown" | "restore-slate") => Promise<void>;
+  onDraft: (value: string, blockDocumentJson: string) => void;
   shouldSkipSave: (relativePath: string) => boolean;
 }) {
   const editor = useCreateBlockNote({ dictionary: language === "en" ? en : pt });
   const [linkPickerOpen, setLinkPickerOpen] = useState(false);
+  const [hasBlockConflict, setHasBlockConflict] = useState(blockDocumentConflict);
+  const [resolvingBlockConflict, setResolvingBlockConflict] = useState(false);
   const [linkQuery, setLinkQuery] = useState("");
   const linkSearchRef = useRef<HTMLInputElement>(null);
   const notesRef = useRef(notes);
   const hydrated = useRef(false);
   const pendingMarkdown = useRef(markdown);
+  const pendingDocumentJson = useRef(blockDocumentJson ?? "");
   const timer = useRef<number | undefined>(undefined);
   const pathRef = useRef(pathKey);
   const pendingPath = useRef(pathKey);
   const saveRef = useRef(onSave);
+  const resolveConflictRef = useRef(onResolveConflict);
   const draftRef = useRef(onDraft);
   const skipSaveRef = useRef(shouldSkipSave);
   pathRef.current = pathKey;
   saveRef.current = onSave;
+  resolveConflictRef.current = onResolveConflict;
   draftRef.current = onDraft;
   skipSaveRef.current = shouldSkipSave;
   notesRef.current = notes;
@@ -91,32 +104,43 @@ function NoteEditor({
     pathRef.current = pathKey;
     pendingPath.current = pathKey;
     hydrated.current = false;
+    setHasBlockConflict(blockDocumentConflict);
     const migratedMarkdown = wikiLinksToMarkdown(markdown, notesRef.current);
-    const blocks = editor.tryParseMarkdownToBlocks(migratedMarkdown);
+    let blocks;
+    try {
+      blocks = blockDocumentJson && !blockDocumentConflict
+        ? JSON.parse(blockDocumentJson) as typeof editor.document
+        : editor.tryParseMarkdownToBlocks(migratedMarkdown);
+    } catch (cause) {
+      blocks = editor.tryParseMarkdownToBlocks(migratedMarkdown);
+      void logError(`[editor.document-load.error] path=${pathKey} error=${String(cause)}`).catch(() => undefined);
+    }
     void logDebug(`[editor.load] path=${pathKey} blocks=${blocks.length} types=${[...new Set(blocks.map((block) => block.type))].join(",")} markdownChars=${migratedMarkdown.length}`).catch(() => undefined);
     editor.replaceBlocks(editor.document, blocks);
     pendingMarkdown.current = migratedMarkdown === markdown ? markdown : editor.blocksToMarkdownLossy();
+    pendingDocumentJson.current = JSON.stringify(editor.document);
+    draftRef.current(pendingMarkdown.current, pendingDocumentJson.current);
     hydrated.current = true;
     if (pendingMarkdown.current !== markdown) {
-      draftRef.current(pendingMarkdown.current);
       timer.current = window.setTimeout(() => {
-        saveRef.current(pendingMarkdown.current, pendingPath.current);
+        saveRef.current(pendingMarkdown.current, pendingPath.current, pendingDocumentJson.current);
       }, 350);
     }
-  }, [editor, markdown, pathKey]);
+  }, [blockDocumentConflict, blockDocumentJson, editor, markdown, pathKey]);
 
   useEditorChange(() => {
     if (!hydrated.current) return;
 
     pendingMarkdown.current = editor.blocksToMarkdownLossy();
+    pendingDocumentJson.current = JSON.stringify(editor.document);
     pendingPath.current = pathRef.current;
-    draftRef.current(pendingMarkdown.current);
+    draftRef.current(pendingMarkdown.current, pendingDocumentJson.current);
     const blockTypes = [...new Set(editor.document.map((block) => block.type))].join(",");
     const markdownChars = pendingMarkdown.current.length;
     if (timer.current !== undefined) window.clearTimeout(timer.current);
     timer.current = window.setTimeout(() => {
-      void logDebug(`[editor.serialize] path=${pendingPath.current} blockTypes=${blockTypes} markdownChars=${markdownChars}`).catch(() => undefined);
-      saveRef.current(pendingMarkdown.current, pendingPath.current);
+      void logDebug(`[editor.serialize] path=${pendingPath.current} blockTypes=${blockTypes} markdownChars=${markdownChars} jsonChars=${pendingDocumentJson.current.length}`).catch(() => undefined);
+      saveRef.current(pendingMarkdown.current, pendingPath.current, pendingDocumentJson.current);
     }, 350);
   }, editor);
 
@@ -124,7 +148,7 @@ function NoteEditor({
     () => () => {
       if (timer.current !== undefined) window.clearTimeout(timer.current);
       if (hydrated.current && !skipSaveRef.current(pendingPath.current)) {
-        saveRef.current(pendingMarkdown.current, pendingPath.current);
+        saveRef.current(pendingMarkdown.current, pendingPath.current, pendingDocumentJson.current);
       }
     },
     [],
@@ -183,6 +207,44 @@ function NoteEditor({
       <BlockNoteView editor={editor} theme="light" slashMenu={false}>
         <SuggestionMenuController triggerCharacter="/" getItems={slashMenuItems} />
       </BlockNoteView>
+      {hasBlockConflict && (
+        <div className="toast-error block-document-conflict" role="alert">
+          <span>{language === "en"
+            ? "This Markdown file changed outside Slate. Choose to use its current text; Slate will keep a backup of the previous editor structure."
+            : "Este arquivo Markdown mudou fora do Slate. Escolha usar o texto atual; o Slate guardará uma cópia da estrutura anterior."}</span>
+          <button
+            className="primary-button"
+            disabled={resolvingBlockConflict}
+            onClick={() => {
+              setResolvingBlockConflict(true);
+              void resolveConflictRef.current(pendingMarkdown.current, pendingPath.current, pendingDocumentJson.current, "use-current-markdown")
+                .then(() => setHasBlockConflict(false))
+                .catch(() => undefined)
+                .finally(() => setResolvingBlockConflict(false));
+            }}
+          >{language === "en" ? "Use current Markdown" : "Usar Markdown atual"}</button>
+          {blockDocumentJson && blockDocumentMarkdownSnapshot !== undefined && blockDocumentMarkdownSnapshot !== null && (
+            <button
+              className="secondary-button"
+              disabled={resolvingBlockConflict}
+              onClick={() => {
+                setResolvingBlockConflict(true);
+                void resolveConflictRef.current(blockDocumentMarkdownSnapshot, pendingPath.current, blockDocumentJson, "restore-slate")
+                  .then(() => {
+                    const priorBlocks = JSON.parse(blockDocumentJson) as typeof editor.document;
+                    editor.replaceBlocks(editor.document, priorBlocks);
+                    pendingMarkdown.current = blockDocumentMarkdownSnapshot;
+                    pendingDocumentJson.current = blockDocumentJson;
+                    draftRef.current(blockDocumentMarkdownSnapshot, blockDocumentJson);
+                    setHasBlockConflict(false);
+                  })
+                  .catch(() => undefined)
+                  .finally(() => setResolvingBlockConflict(false));
+              }}
+            >{language === "en" ? "Restore Slate version" : "Restaurar versão do Slate"}</button>
+          )}
+        </div>
+      )}
       {linkPickerOpen && (
         <div className="link-picker-backdrop" onMouseDown={(event) => {
           if (event.target === event.currentTarget) setLinkPickerOpen(false);
@@ -579,6 +641,8 @@ function App() {
   const initializingVault = useRef(false);
   const activePath = useRef("");
   const currentContent = useRef("");
+  const currentBlockDocumentJson = useRef("");
+  const openedMarkdownSnapshot = useRef("");
   const saveQueue = useRef<Promise<void>>(Promise.resolve());
   const saveRequestId = useRef(0);
   const closingWindow = useRef(false);
@@ -597,15 +661,30 @@ function App() {
     return nextEntries;
   }, []);
 
-  const persistNote = useCallback((path: string, relativePath: string, content: string) => {
+  const persistNote = useCallback((
+    path: string,
+    relativePath: string,
+    content: string,
+    blockDocumentJson = currentBlockDocumentJson.current,
+    conflictResolution: "none" | "use-current-markdown" | "restore-slate" = "none",
+  ) => {
     const requestId = ++saveRequestId.current;
+    const expectedMarkdownSnapshot = openedMarkdownSnapshot.current;
+    if (activePath.current === relativePath) openedMarkdownSnapshot.current = content;
     setSaveStatus("saving");
-    void logDebug(`[save.start] path=${relativePath} chars=${content.length}`).catch(() => undefined);
+    void logDebug(`[save.start] path=${relativePath} chars=${content.length} jsonChars=${blockDocumentJson.length}`).catch(() => undefined);
     const pending = saveQueue.current
       .catch(() => undefined)
       .then(async () => {
         try {
-          await invoke<void>("save_note", { vaultPath: path, relativePath, content });
+          await invoke<void>("save_note", {
+            vaultPath: path,
+            relativePath,
+            content,
+            blockDocumentJson,
+            expectedMarkdownSnapshot,
+            conflictResolution,
+          });
           void logInfo(`[save.ok] path=${relativePath} chars=${content.length}`).catch(() => undefined);
           if (requestId === saveRequestId.current) setSaveStatus("saved");
         } catch (cause) {
@@ -676,6 +755,8 @@ function App() {
     setActivePathKey(note.relativePath);
     activePath.current = note.relativePath;
     currentContent.current = note.content;
+    currentBlockDocumentJson.current = note.blockDocumentJson ?? "";
+    openedMarkdownSnapshot.current = note.content;
     setMenuOpen(false);
     setSearchOpen(false);
   }, []);
@@ -849,14 +930,19 @@ function App() {
     setSelectedNotePaths(new Set());
     activePath.current = "";
     currentContent.current = "";
+    currentBlockDocumentJson.current = "";
+    openedMarkdownSnapshot.current = "";
     setError("");
   }
 
-  async function saveMarkdown(relativePath: string, content: string) {
+  async function saveMarkdown(relativePath: string, content: string, blockDocumentJson: string) {
     if (!vaultPath || !relativePath || blockedSavePaths.current.has(relativePath)) return;
-    if (activePath.current === relativePath) currentContent.current = content;
+    if (activePath.current === relativePath) {
+      currentContent.current = content;
+      currentBlockDocumentJson.current = blockDocumentJson;
+    }
     try {
-      await persistNote(vaultPath, relativePath, content);
+      await persistNote(vaultPath, relativePath, content, blockDocumentJson);
     } catch (cause) {
       if (activePath.current === relativePath) {
         setError(String(cause));
@@ -870,6 +956,18 @@ function App() {
         setError(t("treeUpdateError", { error: String(cause) }));
       }
     }
+  }
+
+  async function resolveMarkdownConflict(
+    relativePath: string,
+    content: string,
+    blockDocumentJson: string,
+    resolution: "use-current-markdown" | "restore-slate",
+  ) {
+    if (!vaultPath || blockedSavePaths.current.has(relativePath)) return;
+    currentContent.current = content;
+    currentBlockDocumentJson.current = blockDocumentJson;
+    await persistNote(vaultPath, relativePath, content, blockDocumentJson, resolution);
   }
 
   async function organizeNote() {
@@ -895,6 +993,8 @@ function App() {
       setActivePathKey(moved.relativePath);
       activePath.current = moved.relativePath;
       currentContent.current = moved.content;
+      currentBlockDocumentJson.current = moved.blockDocumentJson ?? currentBlockDocumentJson.current;
+      openedMarkdownSnapshot.current = moved.content;
       setSelectedFolder("Draft");
       setMenuOpen(false);
     } catch (cause) {
@@ -937,6 +1037,8 @@ function App() {
         setActivePathKey(movedActive.relativePath);
         activePath.current = movedActive.relativePath;
         currentContent.current = movedActive.content;
+        currentBlockDocumentJson.current = movedActive.blockDocumentJson ?? currentBlockDocumentJson.current;
+        openedMarkdownSnapshot.current = movedActive.content;
       }
       await refreshTree(vaultPath);
       setSelectedNotePaths(new Set());
@@ -984,10 +1086,14 @@ function App() {
         setActivePathKey(next.relativePath);
         activePath.current = next.relativePath;
         currentContent.current = next.content;
+        currentBlockDocumentJson.current = next.blockDocumentJson ?? "";
+        openedMarkdownSnapshot.current = next.content;
       } else {
         setActivePathKey("");
         activePath.current = "";
         currentContent.current = "";
+        currentBlockDocumentJson.current = "";
+        openedMarkdownSnapshot.current = "";
       }
     }
   }
@@ -1046,6 +1152,8 @@ function App() {
         setActivePathKey(renamed.relativePath);
         activePath.current = renamed.relativePath;
         currentContent.current = renamed.content;
+        currentBlockDocumentJson.current = renamed.blockDocumentJson ?? currentBlockDocumentJson.current;
+        openedMarkdownSnapshot.current = renamed.content;
       }
       setRenameTarget(null);
     } catch (cause) {
@@ -1078,10 +1186,14 @@ function App() {
           setActivePathKey(next.relativePath);
           activePath.current = next.relativePath;
           currentContent.current = next.content;
+          currentBlockDocumentJson.current = next.blockDocumentJson ?? "";
+          openedMarkdownSnapshot.current = next.content;
         } else {
           setActivePathKey("");
           activePath.current = "";
           currentContent.current = "";
+          currentBlockDocumentJson.current = "";
+          openedMarkdownSnapshot.current = "";
         }
       }
       await refreshTree(vaultPath);
@@ -1460,6 +1572,9 @@ function App() {
                 key={language}
                 pathKey={activeNote.relativePath}
                 markdown={activeNote.content}
+                blockDocumentJson={activeNote.blockDocumentJson}
+                blockDocumentConflict={activeNote.blockDocumentConflict}
+                blockDocumentMarkdownSnapshot={activeNote.blockDocumentMarkdownSnapshot}
                 notes={noteEntries}
                 language={language}
                 t={t}
@@ -1468,10 +1583,12 @@ function App() {
                   if (targetNote) void loadNote(targetNote.relativePath);
                   else setError(t("linkNotFound", { target }));
                 }}
-                onSave={(content, path) => void saveMarkdown(path, content)}
+                onSave={(content, path, blockDocumentJson) => void saveMarkdown(path, content, blockDocumentJson)}
+                onResolveConflict={(content, path, blockDocumentJson, resolution) => resolveMarkdownConflict(path, content, blockDocumentJson, resolution)}
                 shouldSkipSave={(path) => closingWindow.current || blockedSavePaths.current.has(path)}
-                onDraft={(content) => {
+                onDraft={(content, blockDocumentJson) => {
                   currentContent.current = content;
+                  currentBlockDocumentJson.current = blockDocumentJson;
                   setSaveStatus("saving");
                 }}
               />

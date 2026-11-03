@@ -1,9 +1,11 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
     collections::HashSet,
     fs::{self, OpenOptions},
     io::Write,
     path::{Component, Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
 };
 use tauri::{AppHandle, Manager};
 
@@ -22,6 +24,18 @@ struct NoteData {
     name: String,
     relative_path: String,
     content: String,
+    block_document_json: Option<String>,
+    block_document_conflict: bool,
+    block_document_markdown_snapshot: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BlockDocumentMetadata {
+    version: u32,
+    relative_path: String,
+    markdown_snapshot: String,
+    document: serde_json::Value,
 }
 
 #[derive(Debug, Serialize)]
@@ -165,6 +179,213 @@ fn resolve_directory(root: &Path, relative_path: &str) -> Result<PathBuf, String
         return Err("A pasta precisa estar dentro da pasta de notas.".to_string());
     }
     Ok(path)
+}
+
+fn metadata_directory(root: &Path) -> Result<PathBuf, String> {
+    let directory = root.join(".slate-data");
+    match fs::symlink_metadata(&directory) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            return Err("A pasta .slate-data precisa ser uma pasta local segura.".to_string());
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir(&directory).map_err(|error| {
+                format!("Não foi possível preparar os dados locais do Slate: {error}")
+            })?;
+        }
+        Err(error) => {
+            return Err(format!(
+                "Não foi possível acessar os dados locais do Slate: {error}"
+            ));
+        }
+    }
+    hide_metadata_directory(&directory)?;
+    Ok(directory)
+}
+
+#[cfg(windows)]
+fn hide_metadata_directory(directory: &Path) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_HIDDEN, GetFileAttributesW, INVALID_FILE_ATTRIBUTES, SetFileAttributesW,
+    };
+
+    let wide = directory
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let attributes = unsafe { GetFileAttributesW(wide.as_ptr()) };
+    if attributes == INVALID_FILE_ATTRIBUTES {
+        return Err(format!(
+            "Não foi possível verificar a pasta de dados do Slate: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let hidden_attributes = attributes | FILE_ATTRIBUTE_HIDDEN;
+    if unsafe { SetFileAttributesW(wide.as_ptr(), hidden_attributes) } == 0 {
+        return Err(format!(
+            "Não foi possível ocultar a pasta local de dados do Slate: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn hide_metadata_directory(_directory: &Path) -> Result<(), String> {
+    Ok(())
+}
+
+fn metadata_path(root: &Path, relative_path: &str, create: bool) -> Result<PathBuf, String> {
+    let directory = root.join(".slate-data");
+    if create {
+        metadata_directory(root)?;
+    } else if !directory.exists() {
+        return Ok(directory.join("blocks").join("missing.json"));
+    }
+    let metadata = fs::symlink_metadata(&directory)
+        .map_err(|error| format!("Não foi possível acessar os dados locais do Slate: {error}"))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err("A pasta .slate-data precisa ser uma pasta local segura.".to_string());
+    }
+    let blocks = directory.join("blocks");
+    match fs::symlink_metadata(&blocks) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            return Err("A pasta de estruturas locais da nota precisa ser segura.".to_string());
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(format!(
+                "Não foi possível acessar a estrutura local da nota: {error}"
+            ));
+        }
+    }
+    if create {
+        fs::create_dir(&blocks)
+            .or_else(|error| {
+                if error.kind() == std::io::ErrorKind::AlreadyExists {
+                    Ok(())
+                } else {
+                    Err(error)
+                }
+            })
+            .map_err(|error| format!("Não foi possível preparar a estrutura da nota: {error}"))?;
+    }
+    let hash = Sha256::digest(relative_path.replace('\\', "/").as_bytes());
+    let hash = hash
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    Ok(blocks.join(format!("{hash}.json")))
+}
+
+fn read_block_metadata(
+    root: &Path,
+    relative_path: &str,
+) -> Result<Option<BlockDocumentMetadata>, String> {
+    let path = metadata_path(root, relative_path, false)?;
+    match fs::read_to_string(path) {
+        Ok(value) => serde_json::from_str(&value)
+            .map(Some)
+            .map_err(|error| format!("Os dados locais da nota estão inválidos: {error}")),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!(
+            "Não foi possível ler a estrutura local da nota: {error}"
+        )),
+    }
+}
+
+fn atomic_write(path: &Path, content: &[u8]) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| "Não foi possível localizar a pasta do arquivo.".to_string())?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)
+        .map_err(|error| format!("Não foi possível preparar o salvamento: {error}"))?;
+    temporary
+        .write_all(content)
+        .map_err(|error| format!("Não foi possível gravar o arquivo: {error}"))?;
+    temporary
+        .as_file()
+        .sync_all()
+        .map_err(|error| format!("Não foi possível confirmar a gravação: {error}"))?;
+    temporary
+        .persist(path)
+        .map_err(|error| format!("Não foi possível substituir o arquivo: {}", error.error))?;
+    Ok(())
+}
+
+fn note_data(root: &Path, path: &Path, content: String) -> Result<NoteData, String> {
+    let relative_path = relative_string(root, path)?;
+    let metadata = read_block_metadata(root, &relative_path)?;
+    let conflict = metadata
+        .as_ref()
+        .is_some_and(|item| item.markdown_snapshot != content);
+    let block_document_json = metadata.as_ref().map(|item| item.document.to_string());
+    let block_document_markdown_snapshot = metadata.map(|item| item.markdown_snapshot);
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("Nota.md")
+        .to_string();
+    Ok(NoteData {
+        name,
+        relative_path,
+        content,
+        block_document_json,
+        block_document_conflict: conflict,
+        block_document_markdown_snapshot,
+    })
+}
+
+fn relocate_block_metadata(
+    root: &Path,
+    old_relative: &str,
+    new_relative: &str,
+    copy: bool,
+) -> Result<(), String> {
+    let Some(mut metadata) = read_block_metadata(root, old_relative)? else {
+        return Ok(());
+    };
+    metadata.relative_path = new_relative.to_string();
+    let target = metadata_path(root, new_relative, true)?;
+    let encoded = serde_json::to_vec_pretty(&metadata)
+        .map_err(|error| format!("Não foi possível preparar a estrutura local da nota: {error}"))?;
+    atomic_write(&target, &encoded)?;
+    if !copy {
+        let source = metadata_path(root, old_relative, false)?;
+        if source != target {
+            let _ = fs::remove_file(source);
+        }
+    }
+    Ok(())
+}
+
+fn remove_block_metadata(root: &Path, relative_path: &str) -> Result<(), String> {
+    let path = metadata_path(root, relative_path, false)?;
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "Não foi possível remover os dados locais da nota: {error}"
+        )),
+    }
+}
+
+fn update_metadata_snapshot(
+    root: &Path,
+    relative_path: &str,
+    markdown: &str,
+) -> Result<(), String> {
+    let Some(mut metadata) = read_block_metadata(root, relative_path)? else {
+        return Ok(());
+    };
+    metadata.markdown_snapshot = markdown.to_string();
+    let path = metadata_path(root, relative_path, true)?;
+    let encoded = serde_json::to_vec_pretty(&metadata)
+        .map_err(|error| format!("Não foi possível preparar os dados locais da nota: {error}"))?;
+    atomic_write(&path, &encoded)
 }
 
 fn relative_string(root: &Path, path: &Path) -> Result<String, String> {
@@ -615,6 +836,9 @@ fn create_draft(vault_path: String) -> Result<NoteData, String> {
                     name,
                     relative_path: relative_string(&root, &path)?,
                     content: String::new(),
+                    block_document_json: None,
+                    block_document_conflict: false,
+                    block_document_markdown_snapshot: None,
                 });
             }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
@@ -636,16 +860,7 @@ fn read_note(vault_path: String, relative_path: String) -> Result<NoteData, Stri
     let path = resolve_note(&root, &relative_path)?;
     let content = fs::read_to_string(&path)
         .map_err(|error| format!("Não foi possível ler a nota: {error}"))?;
-    let name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("Nota.md")
-        .to_string();
-    Ok(NoteData {
-        name,
-        relative_path: relative_string(&root, &path)?,
-        content,
-    })
+    note_data(&root, &path, content)
 }
 
 #[tauri::command]
@@ -757,6 +972,7 @@ fn rename_note(
 
     fs::rename(&source, &target)
         .map_err(|error| format!("Não foi possível renomear a nota: {error}"))?;
+    relocate_block_metadata(&root, &old_relative, &new_relative, false)?;
     let mut written_paths = Vec::new();
     for (path, original, updated) in &updates {
         if let Err(error) = fs::write(path, updated) {
@@ -764,38 +980,113 @@ fn rename_note(
                 let _ = fs::write(written_path, original_content);
             }
             let _ = fs::rename(&target, &source);
+            let _ = relocate_block_metadata(&root, &new_relative, &old_relative, false);
             return Err(format!(
                 "Não foi possível atualizar os links da nota: {error}"
             ));
         }
         written_paths.push((path.clone(), original.clone()));
+        let changed_relative = relative_string(&root, path)?;
+        update_metadata_snapshot(&root, &changed_relative, updated)?;
     }
 
     read_note(vault_path, new_relative)
 }
 
 #[tauri::command]
-fn save_note(vault_path: String, relative_path: String, content: String) -> Result<(), String> {
+fn save_note(
+    vault_path: String,
+    relative_path: String,
+    content: String,
+    block_document_json: String,
+    expected_markdown_snapshot: String,
+    conflict_resolution: String,
+) -> Result<(), String> {
     let root = canonical_vault(&vault_path)?;
     let path = resolve_note(&root, &relative_path)?;
-    let parent = path
-        .parent()
-        .ok_or_else(|| "Não foi possível localizar a pasta da nota.".to_string())?;
-    let mut temporary = tempfile::NamedTempFile::new_in(parent)
-        .map_err(|error| format!("Não foi possível preparar o salvamento: {error}"))?;
-    temporary
-        .write_all(content.as_bytes())
-        .map_err(|error| format!("Não foi possível gravar o conteúdo: {error}"))?;
-    temporary
-        .as_file()
-        .sync_all()
-        .map_err(|error| format!("Não foi possível confirmar a gravação: {error}"))?;
-    temporary.persist(&path).map_err(|error| {
-        format!(
-            "Não foi possível substituir o arquivo da nota: {}",
-            error.error
+    let document = if block_document_json.trim().is_empty() {
+        None
+    } else {
+        Some(
+            serde_json::from_str::<serde_json::Value>(&block_document_json)
+                .map_err(|error| format!("A estrutura da nota está inválida: {error}"))?,
         )
-    })?;
+    };
+    let current_markdown = fs::read_to_string(&path)
+        .map_err(|error| format!("Não foi possível conferir a versão atual da nota: {error}"))?;
+    let metadata = read_block_metadata(&root, &relative_path)?;
+    let has_conflict = current_markdown != expected_markdown_snapshot
+        || metadata
+            .as_ref()
+            .is_some_and(|existing| existing.markdown_snapshot != current_markdown);
+    if has_conflict {
+        if conflict_resolution == "none" {
+            return Err("A nota foi alterada fora do Slate desde a última abertura. Revise o aviso na nota antes de salvar.".to_string());
+        }
+        let recovery = metadata_directory(&root)?.join("recovery");
+        match fs::symlink_metadata(&recovery) {
+            Ok(item) if item.file_type().is_symlink() || !item.is_dir() => {
+                return Err("A pasta de recuperação local não é segura.".to_string());
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                fs::create_dir(&recovery).map_err(|error| {
+                    format!("Não foi possível preparar a cópia de segurança: {error}")
+                })?;
+            }
+            Err(error) => {
+                return Err(format!(
+                    "Não foi possível acessar a pasta de recuperação: {error}"
+                ));
+            }
+        }
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        let hash = Sha256::digest(relative_path.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        if metadata.is_some() {
+            let previous = metadata_path(&root, &relative_path, false)?;
+            fs::copy(&previous, recovery.join(format!("{hash}-{timestamp}.json"))).map_err(
+                |error| format!("Não foi possível guardar a estrutura anterior: {error}"),
+            )?;
+        }
+        fs::copy(&path, recovery.join(format!("{hash}-{timestamp}.md"))).map_err(|error| {
+            format!("Não foi possível guardar uma cópia do Markdown externo: {error}")
+        })?;
+        if conflict_resolution == "restore-slate" {
+            let previous = metadata
+                .as_ref()
+                .ok_or_else(|| "Não há estrutura anterior para restaurar.".to_string())?;
+            if previous.markdown_snapshot != content
+                || document.as_ref() != Some(&previous.document)
+            {
+                return Err(
+                    "A versão escolhida para restauração não corresponde aos dados locais salvos."
+                        .to_string(),
+                );
+            }
+        } else if conflict_resolution != "use-current-markdown" {
+            return Err("A resolução do conflito não é válida.".to_string());
+        }
+    }
+    if block_document_json.trim().is_empty() {
+        return atomic_write(&path, content.as_bytes());
+    }
+    let metadata = BlockDocumentMetadata {
+        version: 1,
+        relative_path: relative_path.clone(),
+        markdown_snapshot: content.clone(),
+        document: document.ok_or_else(|| "A estrutura da nota está vazia.".to_string())?,
+    };
+    let encoded = serde_json::to_vec_pretty(&metadata)
+        .map_err(|error| format!("Não foi possível preparar a estrutura da nota: {error}"))?;
+    let metadata_path = metadata_path(&root, &relative_path, true)?;
+    atomic_write(&metadata_path, &encoded)?;
+    atomic_write(&path, content.as_bytes())?;
     Ok(())
 }
 
@@ -815,12 +1106,14 @@ fn delete_notes(vault_path: String, relative_paths: Vec<String>) -> Result<(), S
         }
     }
     for path in paths {
+        let relative_path = relative_string(&root, &path)?;
         fs::remove_file(&path).map_err(|error| {
             format!(
                 "Não foi possível apagar {}: {error}",
                 relative_string(&root, &path).unwrap_or_default()
             )
         })?;
+        remove_block_metadata(&root, &relative_path)?;
     }
     Ok(())
 }
@@ -877,6 +1170,12 @@ fn move_note(
     }
     fs::rename(&source, &target)
         .map_err(|error| format!("Não foi possível mover a nota: {error}"))?;
+    relocate_block_metadata(
+        &root,
+        &source_relative_path,
+        &relative_string(&root, &target)?,
+        false,
+    )?;
     let name = target
         .file_name()
         .and_then(|name| name.to_str())
@@ -884,11 +1183,9 @@ fn move_note(
         .to_string();
     let content = fs::read_to_string(&target)
         .map_err(|error| format!("A nota foi movida, mas não pôde ser reaberta: {error}"))?;
-    Ok(NoteData {
-        name,
-        relative_path: relative_string(&root, &target)?,
-        content,
-    })
+    let mut note = note_data(&root, &target, content)?;
+    note.name = name;
+    Ok(note)
 }
 
 #[tauri::command]
@@ -957,6 +1254,17 @@ fn move_notes(
         completed.push((source.clone(), target.clone()));
     }
 
+    for (source_relative, _, target, already_there, _) in &plans {
+        if !already_there {
+            relocate_block_metadata(
+                &root,
+                source_relative,
+                &relative_string(&root, target)?,
+                false,
+            )?;
+        }
+    }
+
     plans
         .into_iter()
         .map(
@@ -967,13 +1275,10 @@ fn move_notes(
                     .and_then(|name| name.to_str())
                     .unwrap_or("Nota.md")
                     .to_string();
+                let note = note_data(&root, &final_path, content)?;
                 Ok(MovedNote {
                     source_relative_path,
-                    note: NoteData {
-                        name,
-                        relative_path: relative_string(&root, &final_path)?,
-                        content,
-                    },
+                    note: NoteData { name, ..note },
                 })
             },
         )
@@ -1044,6 +1349,8 @@ fn copy_notes(
 
     let mut created = Vec::new();
     for (source, target) in plans {
+        let source_relative = relative_string(&root, &source)?;
+        let target_relative = relative_string(&root, &target)?;
         let copy_result = (|| -> Result<(), String> {
             let mut input = fs::File::open(&source)
                 .map_err(|error| format!("Não foi possível ler a nota: {error}"))?;
@@ -1067,6 +1374,7 @@ fn copy_notes(
             }
             return Err(error);
         }
+        relocate_block_metadata(&root, &source_relative, &target_relative, true)?;
         created.push(target);
     }
     Ok(())

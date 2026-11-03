@@ -11,6 +11,9 @@ export interface ActiveNote {
   name: string;
   relativePath: string;
   content: string;
+  blockDocumentJson?: string | null;
+  blockDocumentConflict?: boolean;
+  blockDocumentMarkdownSnapshot?: string | null;
 }
 
 export interface MovedNote {

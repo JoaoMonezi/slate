@@ -1122,6 +1122,27 @@
   font-size: 11px;
 }
 
+.block-document-conflict {
+  max-width: min(760px, calc(100vw - 40px));
+  flex-wrap: wrap;
+}
+
+.secondary-button {
+  min-height: 30px;
+  padding: 0 9px;
+  border: 1px solid #d8d5cf;
+  border-radius: 6px;
+  color: #333;
+  background: #fff;
+  cursor: pointer;
+  font: inherit;
+}
+
+.secondary-button:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
 .note-context-menu {
   position: fixed;
   z-index: 30;

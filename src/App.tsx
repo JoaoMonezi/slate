@@ -698,15 +698,17 @@ function App() {
             conflictResolution,
           });
           persistedMarkdownByPath.current.set(relativePath, content);
-          setOpenNotes((current) => current.map((note) => note.relativePath === relativePath
-            ? {
-                ...note,
-                content,
-                blockDocumentJson,
-                blockDocumentMarkdownSnapshot: content,
-                blockDocumentConflict: false,
-              }
-            : note));
+          if (activePath.current !== relativePath) {
+            setOpenNotes((current) => current.map((note) => note.relativePath === relativePath
+              ? {
+                  ...note,
+                  content,
+                  blockDocumentJson,
+                  blockDocumentMarkdownSnapshot: content,
+                  blockDocumentConflict: false,
+                }
+              : note));
+          }
           void logInfo(`[save.ok] path=${relativePath} chars=${content.length}`).catch(() => undefined);
           if (requestId === saveRequestId.current) setSaveStatus("saved");
         } catch (cause) {

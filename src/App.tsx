@@ -71,7 +71,7 @@ function NoteEditor({
   onOpenNoteLink: (target: string) => void;
   onSave: (value: string, relativePath: string, blockDocumentJson: string) => void;
   onResolveConflict: (value: string, relativePath: string, blockDocumentJson: string, resolution: "use-current-markdown" | "restore-slate") => Promise<void>;
-  onDraft: (value: string, blockDocumentJson: string) => void;
+  onDraft: (value: string, blockDocumentJson: string, hasUnsavedChanges: boolean) => void;
   shouldSkipSave: (relativePath: string) => boolean;
 }) {
   const editor = useCreateBlockNote({ dictionary: language === "en" ? en : pt });
@@ -99,6 +99,15 @@ function NoteEditor({
   notesRef.current = notes;
 
   useEffect(() => {
+    if (
+      hydrated.current
+      && pathRef.current === pathKey
+      && pendingMarkdown.current === markdown
+      && pendingDocumentJson.current === (blockDocumentJson ?? pendingDocumentJson.current)
+      && hasBlockConflict === blockDocumentConflict
+    ) {
+      return;
+    }
     if (timer.current !== undefined) window.clearTimeout(timer.current);
     timer.current = undefined;
     pathRef.current = pathKey;
@@ -119,9 +128,10 @@ function NoteEditor({
     editor.replaceBlocks(editor.document, blocks);
     pendingMarkdown.current = migratedMarkdown === markdown ? markdown : editor.blocksToMarkdownLossy();
     pendingDocumentJson.current = JSON.stringify(editor.document);
-    draftRef.current(pendingMarkdown.current, pendingDocumentJson.current);
+    const hasMarkdownMigration = pendingMarkdown.current !== markdown;
+    draftRef.current(pendingMarkdown.current, pendingDocumentJson.current, hasMarkdownMigration);
     hydrated.current = true;
-    if (pendingMarkdown.current !== markdown) {
+    if (hasMarkdownMigration) {
       timer.current = window.setTimeout(() => {
         saveRef.current(pendingMarkdown.current, pendingPath.current, pendingDocumentJson.current);
       }, 350);
@@ -134,7 +144,7 @@ function NoteEditor({
     pendingMarkdown.current = editor.blocksToMarkdownLossy();
     pendingDocumentJson.current = JSON.stringify(editor.document);
     pendingPath.current = pathRef.current;
-    draftRef.current(pendingMarkdown.current, pendingDocumentJson.current);
+    draftRef.current(pendingMarkdown.current, pendingDocumentJson.current, true);
     const blockTypes = [...new Set(editor.document.map((block) => block.type))].join(",");
     const markdownChars = pendingMarkdown.current.length;
     if (timer.current !== undefined) window.clearTimeout(timer.current);
@@ -235,7 +245,7 @@ function NoteEditor({
                     editor.replaceBlocks(editor.document, priorBlocks);
                     pendingMarkdown.current = blockDocumentMarkdownSnapshot;
                     pendingDocumentJson.current = blockDocumentJson;
-                    draftRef.current(blockDocumentMarkdownSnapshot, blockDocumentJson);
+                    draftRef.current(blockDocumentMarkdownSnapshot, blockDocumentJson, false);
                     setHasBlockConflict(false);
                   })
                   .catch(() => undefined)
@@ -1600,10 +1610,10 @@ function App() {
                 onSave={(content, path, blockDocumentJson) => void saveMarkdown(path, content, blockDocumentJson)}
                 onResolveConflict={(content, path, blockDocumentJson, resolution) => resolveMarkdownConflict(path, content, blockDocumentJson, resolution)}
                 shouldSkipSave={(path) => closingWindow.current || blockedSavePaths.current.has(path)}
-                onDraft={(content, blockDocumentJson) => {
+                onDraft={(content, blockDocumentJson, hasUnsavedChanges) => {
                   currentContent.current = content;
                   currentBlockDocumentJson.current = blockDocumentJson;
-                  setSaveStatus("saving");
+                  if (hasUnsavedChanges) setSaveStatus("saving");
                 }}
               />
             </>

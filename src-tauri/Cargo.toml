@@ -1,6 +1,6 @@
 [package]
 name = "slate"
-version = "0.1.2"
+version = "0.1.3"
 description = "Aplicativo local-first de notas em Markdown"
 authors = ["João Monezi"]
 edition = "2024"

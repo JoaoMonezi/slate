@@ -48,6 +48,8 @@ type SaveStatus = "saving" | "saved" | "error";
 function NoteEditor({
   pathKey,
   markdown,
+  revision,
+  sessionId,
   blockDocumentJson,
   blockDocumentConflict = false,
   blockDocumentMarkdownSnapshot,
@@ -62,6 +64,8 @@ function NoteEditor({
 }: {
   pathKey: string;
   markdown: string;
+  revision: string;
+  sessionId: number;
   blockDocumentJson?: string | null;
   blockDocumentConflict?: boolean;
   blockDocumentMarkdownSnapshot?: string | null;
@@ -69,8 +73,8 @@ function NoteEditor({
   language: Language;
   t: Translator;
   onOpenNoteLink: (target: string) => void;
-  onSave: (value: string, relativePath: string, blockDocumentJson: string) => void;
-  onResolveConflict: (value: string, relativePath: string, blockDocumentJson: string, resolution: "use-current-markdown" | "restore-slate") => Promise<void>;
+  onSave: (value: string, relativePath: string, blockDocumentJson: string, sessionId: number) => void;
+  onResolveConflict: (value: string, relativePath: string, blockDocumentJson: string, resolution: "use-current-markdown" | "restore-slate", sessionId: number) => Promise<void>;
   onDraft: (value: string, blockDocumentJson: string, hasUnsavedChanges: boolean) => void;
   shouldSkipSave: (relativePath: string) => boolean;
 }) {
@@ -87,6 +91,8 @@ function NoteEditor({
   const timer = useRef<number | undefined>(undefined);
   const pathRef = useRef(pathKey);
   const pendingPath = useRef(pathKey);
+  const pendingSessionId = useRef(sessionId);
+  const hydratedSessionId = useRef<number | null>(null);
   const saveRef = useRef(onSave);
   const resolveConflictRef = useRef(onResolveConflict);
   const draftRef = useRef(onDraft);
@@ -101,6 +107,7 @@ function NoteEditor({
   useEffect(() => {
     if (
       hydrated.current
+      && hydratedSessionId.current === sessionId
       && pathRef.current === pathKey
       && pendingMarkdown.current === markdown
       && pendingDocumentJson.current === (blockDocumentJson ?? pendingDocumentJson.current)
@@ -112,6 +119,8 @@ function NoteEditor({
     timer.current = undefined;
     pathRef.current = pathKey;
     pendingPath.current = pathKey;
+    pendingSessionId.current = sessionId;
+    hydratedSessionId.current = sessionId;
     hydrated.current = false;
     setHasBlockConflict(blockDocumentConflict);
     const migratedMarkdown = wikiLinksToMarkdown(markdown, notesRef.current);
@@ -124,7 +133,7 @@ function NoteEditor({
       blocks = editor.tryParseMarkdownToBlocks(migratedMarkdown);
       void logError(`[editor.document-load.error] path=${pathKey} error=${String(cause)}`).catch(() => undefined);
     }
-    void logDebug(`[editor.load] path=${pathKey} blocks=${blocks.length} types=${[...new Set(blocks.map((block) => block.type))].join(",")} markdownChars=${migratedMarkdown.length}`).catch(() => undefined);
+    void logDebug(`[editor.load] path=${pathKey} session=${sessionId} revision=${revision.slice(0, 12)} blocks=${blocks.length} types=${[...new Set(blocks.map((block) => block.type))].join(",")} markdownChars=${migratedMarkdown.length}`).catch(() => undefined);
     editor.replaceBlocks(editor.document, blocks);
     pendingMarkdown.current = migratedMarkdown === markdown ? markdown : editor.blocksToMarkdownLossy();
     pendingDocumentJson.current = JSON.stringify(editor.document);
@@ -133,10 +142,10 @@ function NoteEditor({
     hydrated.current = true;
     if (hasMarkdownMigration) {
       timer.current = window.setTimeout(() => {
-        saveRef.current(pendingMarkdown.current, pendingPath.current, pendingDocumentJson.current);
+        saveRef.current(pendingMarkdown.current, pendingPath.current, pendingDocumentJson.current, pendingSessionId.current);
       }, 350);
     }
-  }, [blockDocumentConflict, blockDocumentJson, editor, markdown, pathKey]);
+  }, [blockDocumentConflict, blockDocumentJson, editor, markdown, pathKey, revision, sessionId]);
 
   useEditorChange(() => {
     if (!hydrated.current) return;
@@ -144,13 +153,14 @@ function NoteEditor({
     pendingMarkdown.current = editor.blocksToMarkdownLossy();
     pendingDocumentJson.current = JSON.stringify(editor.document);
     pendingPath.current = pathRef.current;
+    pendingSessionId.current = sessionId;
     draftRef.current(pendingMarkdown.current, pendingDocumentJson.current, true);
     const blockTypes = [...new Set(editor.document.map((block) => block.type))].join(",");
     const markdownChars = pendingMarkdown.current.length;
     if (timer.current !== undefined) window.clearTimeout(timer.current);
     timer.current = window.setTimeout(() => {
       void logDebug(`[editor.serialize] path=${pendingPath.current} blockTypes=${blockTypes} markdownChars=${markdownChars} jsonChars=${pendingDocumentJson.current.length}`).catch(() => undefined);
-      saveRef.current(pendingMarkdown.current, pendingPath.current, pendingDocumentJson.current);
+      saveRef.current(pendingMarkdown.current, pendingPath.current, pendingDocumentJson.current, pendingSessionId.current);
     }, 350);
   }, editor);
 
@@ -158,7 +168,7 @@ function NoteEditor({
     () => () => {
       if (timer.current !== undefined) window.clearTimeout(timer.current);
       if (hydrated.current && !skipSaveRef.current(pendingPath.current)) {
-        saveRef.current(pendingMarkdown.current, pendingPath.current, pendingDocumentJson.current);
+        saveRef.current(pendingMarkdown.current, pendingPath.current, pendingDocumentJson.current, pendingSessionId.current);
       }
     },
     [],
@@ -227,7 +237,7 @@ function NoteEditor({
             disabled={resolvingBlockConflict}
             onClick={() => {
               setResolvingBlockConflict(true);
-              void resolveConflictRef.current(pendingMarkdown.current, pendingPath.current, pendingDocumentJson.current, "use-current-markdown")
+              void resolveConflictRef.current(pendingMarkdown.current, pendingPath.current, pendingDocumentJson.current, "use-current-markdown", pendingSessionId.current)
                 .then(() => setHasBlockConflict(false))
                 .catch(() => undefined)
                 .finally(() => setResolvingBlockConflict(false));
@@ -239,7 +249,7 @@ function NoteEditor({
               disabled={resolvingBlockConflict}
               onClick={() => {
                 setResolvingBlockConflict(true);
-                void resolveConflictRef.current(blockDocumentMarkdownSnapshot, pendingPath.current, blockDocumentJson, "restore-slate")
+              void resolveConflictRef.current(blockDocumentMarkdownSnapshot, pendingPath.current, blockDocumentJson, "restore-slate", pendingSessionId.current)
                   .then(() => {
                     const priorBlocks = JSON.parse(blockDocumentJson) as typeof editor.document;
                     editor.replaceBlocks(editor.document, priorBlocks);
@@ -653,6 +663,8 @@ function App() {
   const currentContent = useRef("");
   const currentBlockDocumentJson = useRef("");
   const persistedMarkdownByPath = useRef(new Map<string, string>());
+  const noteSessions = useRef(new Map<string, { id: number; revision: string }>());
+  const nextNoteSessionId = useRef(1);
   const saveQueue = useRef<Promise<void>>(Promise.resolve());
   const saveRequestId = useRef(0);
   const closingWindow = useRef(false);
@@ -661,6 +673,12 @@ function App() {
   const activeNote = openNotes.find((note) => note.relativePath === activePathKey) ?? null;
   const noteEntries = useMemo(() => flattenNotes(entries), [entries]);
   activePath.current = activeNote?.relativePath ?? "";
+
+  function startNoteSession(note: ActiveNote): ActiveNote {
+    const sessionId = nextNoteSessionId.current++;
+    noteSessions.current.set(note.relativePath, { id: sessionId, revision: note.revision });
+    return { ...note, sessionId };
+  }
 
   const refreshTree = useCallback(async (path: string) => {
     const nextEntries = await invoke<VaultEntry[]>("list_vault", { vaultPath: path });
@@ -677,31 +695,48 @@ function App() {
     content: string,
     blockDocumentJson = currentBlockDocumentJson.current,
     conflictResolution: "none" | "use-current-markdown" | "restore-slate" = "none",
+    requestedSessionId?: number,
   ) => {
     const requestId = ++saveRequestId.current;
+    const sessionId = requestedSessionId ?? noteSessions.current.get(relativePath)?.id;
     setSaveStatus("saving");
-    void logDebug(`[save.start] path=${relativePath} chars=${content.length} jsonChars=${blockDocumentJson.length}`).catch(() => undefined);
+    void logDebug(`[save.start] path=${relativePath} session=${sessionId ?? "missing"} chars=${content.length} jsonChars=${blockDocumentJson.length}`).catch(() => undefined);
     const pending = saveQueue.current
       .catch(() => undefined)
       .then(async () => {
         try {
+          const session = noteSessions.current.get(relativePath);
+          if (!session || session.id !== sessionId) {
+            await invoke<void>("save_recovery_candidate", {
+              vaultPath: path,
+              relativePath,
+              content,
+              blockDocumentJson,
+            });
+            throw new Error(`A edição de ${relativePath} já foi substituída por uma versão mais recente. O texto atual foi mantido na recuperação local.`);
+          }
           const expectedMarkdownSnapshot = persistedMarkdownByPath.current.get(relativePath);
           if (expectedMarkdownSnapshot === undefined) {
             throw new Error(`Não foi possível validar a versão carregada de ${relativePath}. Reabra a nota antes de salvar.`);
           }
-          await invoke<void>("save_note", {
+          const revision = await invoke<string>("save_note", {
             vaultPath: path,
             relativePath,
             content,
             blockDocumentJson,
-            expectedMarkdownSnapshot,
+            expectedRevision: session.revision,
             conflictResolution,
           });
+          if (noteSessions.current.get(relativePath)?.id !== sessionId) {
+            throw new Error(`A edição de ${relativePath} mudou durante o salvamento.`);
+          }
+          noteSessions.current.set(relativePath, { id: sessionId!, revision });
           persistedMarkdownByPath.current.set(relativePath, content);
           if (activePath.current !== relativePath) {
             setOpenNotes((current) => current.map((note) => note.relativePath === relativePath
               ? {
                   ...note,
+                  revision,
                   content,
                   blockDocumentJson,
                   blockDocumentMarkdownSnapshot: content,
@@ -709,7 +744,7 @@ function App() {
                 }
               : note));
           }
-          void logInfo(`[save.ok] path=${relativePath} chars=${content.length}`).catch(() => undefined);
+          void logInfo(`[save.ok] path=${relativePath} session=${sessionId} revision=${revision.slice(0, 12)} chars=${content.length}`).catch(() => undefined);
           if (requestId === saveRequestId.current) setSaveStatus("saved");
         } catch (cause) {
           void logError(`[save.error] path=${relativePath} error=${String(cause)}`).catch(() => undefined);
@@ -772,17 +807,18 @@ function App() {
   }, [persistNote, vaultPath]);
 
   const selectNoteTab = useCallback((note: ActiveNote) => {
+    const sessionNote = startNoteSession(note);
     blockedSavePaths.current.delete(note.relativePath);
     setOpenNotes((current) => {
       const exists = current.some((item) => item.relativePath === note.relativePath);
       return exists
-        ? current.map((item) => item.relativePath === note.relativePath ? note : item)
-        : [...current, note];
+        ? current.map((item) => item.relativePath === note.relativePath ? sessionNote : item)
+        : [...current, sessionNote];
     });
     setActivePathKey(note.relativePath);
     activePath.current = note.relativePath;
-    currentContent.current = note.content;
-    currentBlockDocumentJson.current = note.blockDocumentJson ?? "";
+    currentContent.current = sessionNote.content;
+    currentBlockDocumentJson.current = sessionNote.blockDocumentJson ?? "";
     persistedMarkdownByPath.current.set(note.relativePath, note.content);
     setMenuOpen(false);
     setSearchOpen(false);
@@ -959,21 +995,20 @@ function App() {
     currentContent.current = "";
     currentBlockDocumentJson.current = "";
     persistedMarkdownByPath.current.clear();
+    noteSessions.current.clear();
     setError("");
   }
 
-  async function saveMarkdown(relativePath: string, content: string, blockDocumentJson: string) {
+  async function saveMarkdown(relativePath: string, content: string, blockDocumentJson: string, sessionId: number) {
     if (!vaultPath || !relativePath || blockedSavePaths.current.has(relativePath)) return;
     if (activePath.current === relativePath) {
       currentContent.current = content;
       currentBlockDocumentJson.current = blockDocumentJson;
     }
     try {
-      await persistNote(vaultPath, relativePath, content, blockDocumentJson);
+      await persistNote(vaultPath, relativePath, content, blockDocumentJson, "none", sessionId);
     } catch (cause) {
-      if (activePath.current === relativePath) {
-        setError(String(cause));
-      }
+      setError(String(cause));
       return;
     }
     try {
@@ -990,11 +1025,12 @@ function App() {
     content: string,
     blockDocumentJson: string,
     resolution: "use-current-markdown" | "restore-slate",
+    sessionId: number,
   ) {
     if (!vaultPath || blockedSavePaths.current.has(relativePath)) return;
     currentContent.current = content;
     currentBlockDocumentJson.current = blockDocumentJson;
-    await persistNote(vaultPath, relativePath, content, blockDocumentJson, resolution);
+    await persistNote(vaultPath, relativePath, content, blockDocumentJson, resolution, sessionId);
   }
 
   async function organizeNote() {
@@ -1008,21 +1044,23 @@ function App() {
         sourceRelativePath: activeNote.relativePath,
         destinationRelativePath: selectedFolder,
       });
+      const movedNote = startNoteSession(moved);
       await refreshTree(vaultPath);
-      setOpenNotes((current) => current.map((note) => note.relativePath === activeNote.relativePath ? moved : note));
+      setOpenNotes((current) => current.map((note) => note.relativePath === activeNote.relativePath ? movedNote : note));
       setSelectedNotePaths((current) => {
         if (!current.has(sourcePath)) return current;
         const next = new Set(current);
         next.delete(sourcePath);
-        next.add(moved.relativePath);
+        next.add(movedNote.relativePath);
         return next;
       });
-      setActivePathKey(moved.relativePath);
-      activePath.current = moved.relativePath;
-      currentContent.current = moved.content;
-      currentBlockDocumentJson.current = moved.blockDocumentJson ?? currentBlockDocumentJson.current;
+      setActivePathKey(movedNote.relativePath);
+      activePath.current = movedNote.relativePath;
+      currentContent.current = movedNote.content;
+      currentBlockDocumentJson.current = movedNote.blockDocumentJson ?? currentBlockDocumentJson.current;
       persistedMarkdownByPath.current.delete(sourcePath);
-      persistedMarkdownByPath.current.set(moved.relativePath, moved.content);
+      noteSessions.current.delete(sourcePath);
+      persistedMarkdownByPath.current.set(movedNote.relativePath, movedNote.content);
       setSelectedFolder("Draft");
       setMenuOpen(false);
     } catch (cause) {
@@ -1058,10 +1096,11 @@ function App() {
         sourceRelativePaths: sourcePaths,
         destinationRelativePath: selectedFolder,
       });
-      const movedBySource = new Map(moved.map((item) => [item.sourceRelativePath, item.note]));
+      const movedBySource = new Map(moved.map((item) => [item.sourceRelativePath, startNoteSession(item.note)]));
       for (const item of moved) {
         persistedMarkdownByPath.current.delete(item.sourceRelativePath);
         persistedMarkdownByPath.current.set(item.note.relativePath, item.note.content);
+        noteSessions.current.delete(item.sourceRelativePath);
       }
       setOpenNotes((current) => current.map((note) => movedBySource.get(note.relativePath) ?? note));
       const movedActive = movedBySource.get(activePath.current);
@@ -1164,27 +1203,29 @@ function App() {
         relativePath: sourcePath,
         newName: nextName,
       });
-      blockedSavePaths.current.delete(renamed.relativePath);
+      const renamedNote = startNoteSession(renamed);
+      blockedSavePaths.current.delete(renamedNote.relativePath);
       await refreshTree(vaultPath);
-      setOpenNotes((current) => current.map((note) => note.relativePath === sourcePath ? renamed : note));
+      setOpenNotes((current) => current.map((note) => note.relativePath === sourcePath ? renamedNote : note));
       setSelectedNotePaths((current) => {
         if (!current.has(sourcePath)) return current;
         const next = new Set(current);
         next.delete(sourcePath);
-        next.add(renamed.relativePath);
+        next.add(renamedNote.relativePath);
         return next;
       });
       setSearchHits((current) => current.map((hit) => hit.relativePath === sourcePath
-        ? { ...hit, name: renamed.name, relativePath: renamed.relativePath }
+        ? { ...hit, name: renamedNote.name, relativePath: renamedNote.relativePath }
         : hit));
       if (wasActive) {
-        setActivePathKey(renamed.relativePath);
-        activePath.current = renamed.relativePath;
-        currentContent.current = renamed.content;
-        currentBlockDocumentJson.current = renamed.blockDocumentJson ?? currentBlockDocumentJson.current;
+        setActivePathKey(renamedNote.relativePath);
+        activePath.current = renamedNote.relativePath;
+        currentContent.current = renamedNote.content;
+        currentBlockDocumentJson.current = renamedNote.blockDocumentJson ?? currentBlockDocumentJson.current;
       }
       persistedMarkdownByPath.current.delete(sourcePath);
-      persistedMarkdownByPath.current.set(renamed.relativePath, renamed.content);
+      noteSessions.current.delete(sourcePath);
+      persistedMarkdownByPath.current.set(renamedNote.relativePath, renamedNote.content);
       setRenameTarget(null);
     } catch (cause) {
       if (wasActive) blockedSavePaths.current.delete(sourcePath);
@@ -1600,6 +1641,8 @@ function App() {
               <NoteEditor
                 key={language}
                 pathKey={activeNote.relativePath}
+                revision={activeNote.revision}
+                sessionId={activeNote.sessionId ?? 0}
                 markdown={activeNote.content}
                 blockDocumentJson={activeNote.blockDocumentJson}
                 blockDocumentConflict={activeNote.blockDocumentConflict}
@@ -1612,8 +1655,8 @@ function App() {
                   if (targetNote) void loadNote(targetNote.relativePath);
                   else setError(t("linkNotFound", { target }));
                 }}
-                onSave={(content, path, blockDocumentJson) => void saveMarkdown(path, content, blockDocumentJson)}
-                onResolveConflict={(content, path, blockDocumentJson, resolution) => resolveMarkdownConflict(path, content, blockDocumentJson, resolution)}
+                onSave={(content, path, blockDocumentJson, sessionId) => void saveMarkdown(path, content, blockDocumentJson, sessionId)}
+                onResolveConflict={(content, path, blockDocumentJson, resolution, sessionId) => resolveMarkdownConflict(path, content, blockDocumentJson, resolution, sessionId)}
                 shouldSkipSave={(path) => closingWindow.current || blockedSavePaths.current.has(path)}
                 onDraft={(content, blockDocumentJson, hasUnsavedChanges) => {
                   currentContent.current = content;

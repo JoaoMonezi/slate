@@ -11,6 +11,8 @@ export interface ActiveNote {
   name: string;
   relativePath: string;
   content: string;
+  revision: string;
+  sessionId?: number;
   blockDocumentJson?: string | null;
   blockDocumentConflict?: boolean;
   blockDocumentMarkdownSnapshot?: string | null;

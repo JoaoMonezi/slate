@@ -24,6 +24,7 @@ struct NoteData {
     name: String,
     relative_path: String,
     content: String,
+    revision: String,
     block_document_json: Option<String>,
     block_document_conflict: bool,
     block_document_markdown_snapshot: Option<String>,
@@ -36,6 +37,14 @@ struct BlockDocumentMetadata {
     relative_path: String,
     markdown_snapshot: String,
     document: serde_json::Value,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RecoveryInfo {
+    relative_path: String,
+    label: String,
+    timestamp_nanos: u128,
 }
 
 #[derive(Debug, Serialize)]
@@ -319,6 +328,7 @@ fn atomic_write(path: &Path, content: &[u8]) -> Result<(), String> {
 fn note_data(root: &Path, path: &Path, content: String) -> Result<NoteData, String> {
     let relative_path = relative_string(root, path)?;
     let metadata = read_block_metadata(root, &relative_path)?;
+    let revision = note_revision(&content, metadata.as_ref());
     let conflict = metadata
         .as_ref()
         .is_some_and(|item| item.markdown_snapshot != content);
@@ -332,11 +342,113 @@ fn note_data(root: &Path, path: &Path, content: String) -> Result<NoteData, Stri
     Ok(NoteData {
         name,
         relative_path,
+        revision,
         content,
         block_document_json,
         block_document_conflict: conflict,
         block_document_markdown_snapshot,
     })
+}
+
+fn note_revision(content: &str, metadata: Option<&BlockDocumentMetadata>) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(content.as_bytes());
+    hasher.update([0]);
+    if let Some(metadata) = metadata {
+        if let Ok(encoded) = serde_json::to_vec(metadata) {
+            hasher.update(encoded);
+        }
+    }
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn recovery_directory(root: &Path) -> Result<PathBuf, String> {
+    let directory = metadata_directory(root)?.join("recovery");
+    match fs::symlink_metadata(&directory) {
+        Ok(item) if item.file_type().is_symlink() || !item.is_dir() => {
+            return Err("A pasta de recuperação local não é segura.".to_string());
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir(&directory).map_err(|error| {
+                format!("Não foi possível preparar a recuperação local: {error}")
+            })?;
+        }
+        Err(error) => {
+            return Err(format!(
+                "Não foi possível acessar a recuperação local: {error}"
+            ));
+        }
+    }
+    Ok(directory)
+}
+
+fn recovery_prefix(relative_path: &str) -> String {
+    Sha256::digest(relative_path.replace('\\', "/").as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn write_recovery_copy(
+    root: &Path,
+    relative_path: &str,
+    markdown: &str,
+    metadata: Option<&BlockDocumentMetadata>,
+    label: &str,
+) -> Result<(), String> {
+    let directory = recovery_directory(root)?;
+    let prefix = recovery_prefix(relative_path);
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let stem = format!("{prefix}-{label}-{timestamp}");
+    atomic_write(&directory.join(format!("{stem}.md")), markdown.as_bytes())?;
+    let info = serde_json::to_vec_pretty(&RecoveryInfo {
+        relative_path: relative_path.to_string(),
+        label: label.to_string(),
+        timestamp_nanos: timestamp,
+    })
+    .map_err(|error| format!("Não foi possível registrar a cópia de recuperação: {error}"))?;
+    atomic_write(&directory.join(format!("{stem}.info.json")), &info)?;
+    if let Some(metadata) = metadata {
+        let encoded = serde_json::to_vec_pretty(metadata)
+            .map_err(|error| format!("Não foi possível preparar a recuperação da nota: {error}"))?;
+        atomic_write(&directory.join(format!("{stem}.json")), &encoded)?;
+    }
+
+    let mut snapshots = fs::read_dir(&directory)
+        .map_err(|error| format!("Não foi possível listar a recuperação local: {error}"))?
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(&format!("{prefix}-"))
+                && entry
+                    .path()
+                    .extension()
+                    .is_some_and(|extension| extension == "md")
+        })
+        .collect::<Vec<_>>();
+    snapshots.sort_by_key(|entry| {
+        entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .unwrap_or(UNIX_EPOCH)
+    });
+    for old in snapshots.into_iter().rev().skip(20) {
+        let old_stem = old.path().with_extension("");
+        let _ = fs::remove_file(old.path());
+        let _ = fs::remove_file(old_stem.with_extension("json"));
+        let _ = fs::remove_file(old_stem.with_extension("info.json"));
+    }
+    Ok(())
 }
 
 fn relocate_block_metadata(
@@ -835,6 +947,7 @@ fn create_draft(vault_path: String) -> Result<NoteData, String> {
                 return Ok(NoteData {
                     name,
                     relative_path: relative_string(&root, &path)?,
+                    revision: note_revision("", None),
                     content: String::new(),
                     block_document_json: None,
                     block_document_conflict: false,
@@ -999,9 +1112,9 @@ fn save_note(
     relative_path: String,
     content: String,
     block_document_json: String,
-    expected_markdown_snapshot: String,
+    expected_revision: String,
     conflict_resolution: String,
-) -> Result<(), String> {
+) -> Result<String, String> {
     let root = canonical_vault(&vault_path)?;
     let path = resolve_note(&root, &relative_path)?;
     let document = if block_document_json.trim().is_empty() {
@@ -1015,57 +1128,51 @@ fn save_note(
     let current_markdown = fs::read_to_string(&path)
         .map_err(|error| format!("Não foi possível conferir a versão atual da nota: {error}"))?;
     let metadata = read_block_metadata(&root, &relative_path)?;
-    let markdown_changed_since_load = current_markdown != expected_markdown_snapshot;
+    let current_revision = note_revision(&current_markdown, metadata.as_ref());
+    let revision_changed_since_load = current_revision != expected_revision;
     let metadata_snapshot_mismatch = metadata
         .as_ref()
         .is_some_and(|existing| existing.markdown_snapshot != current_markdown);
     log::debug!(
-        "[save.conflict-check] path={} markdownChanged={} metadataMismatch={} diskChars={} expectedChars={}",
+        "[save.conflict-check] path={} revisionChanged={} metadataMismatch={} diskChars={} expectedRevision={}",
         relative_path,
-        markdown_changed_since_load,
+        revision_changed_since_load,
         metadata_snapshot_mismatch,
         current_markdown.len(),
-        expected_markdown_snapshot.len()
+        &expected_revision[..expected_revision.len().min(12)]
     );
-    let has_conflict = markdown_changed_since_load || metadata_snapshot_mismatch;
+    let has_conflict = revision_changed_since_load || metadata_snapshot_mismatch;
     if has_conflict {
         if conflict_resolution == "none" {
+            write_recovery_copy(
+                &root,
+                &relative_path,
+                &current_markdown,
+                metadata.as_ref(),
+                "disk",
+            )?;
+            let candidate_metadata = document.as_ref().map(|document| BlockDocumentMetadata {
+                version: 1,
+                relative_path: relative_path.clone(),
+                markdown_snapshot: content.clone(),
+                document: document.clone(),
+            });
+            write_recovery_copy(
+                &root,
+                &relative_path,
+                &content,
+                candidate_metadata.as_ref(),
+                "unsaved",
+            )?;
             return Err("A nota foi alterada fora do Slate desde a última abertura. Revise o aviso na nota antes de salvar.".to_string());
         }
-        let recovery = metadata_directory(&root)?.join("recovery");
-        match fs::symlink_metadata(&recovery) {
-            Ok(item) if item.file_type().is_symlink() || !item.is_dir() => {
-                return Err("A pasta de recuperação local não é segura.".to_string());
-            }
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                fs::create_dir(&recovery).map_err(|error| {
-                    format!("Não foi possível preparar a cópia de segurança: {error}")
-                })?;
-            }
-            Err(error) => {
-                return Err(format!(
-                    "Não foi possível acessar a pasta de recuperação: {error}"
-                ));
-            }
-        }
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis();
-        let hash = Sha256::digest(relative_path.as_bytes())
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>();
-        if metadata.is_some() {
-            let previous = metadata_path(&root, &relative_path, false)?;
-            fs::copy(&previous, recovery.join(format!("{hash}-{timestamp}.json"))).map_err(
-                |error| format!("Não foi possível guardar a estrutura anterior: {error}"),
-            )?;
-        }
-        fs::copy(&path, recovery.join(format!("{hash}-{timestamp}.md"))).map_err(|error| {
-            format!("Não foi possível guardar uma cópia do Markdown externo: {error}")
-        })?;
+        write_recovery_copy(
+            &root,
+            &relative_path,
+            &current_markdown,
+            metadata.as_ref(),
+            "before-resolution",
+        )?;
         if conflict_resolution == "restore-slate" {
             let previous = metadata
                 .as_ref()
@@ -1082,8 +1189,57 @@ fn save_note(
             return Err("A resolução do conflito não é válida.".to_string());
         }
     }
+    let metadata_unchanged = if block_document_json.trim().is_empty() {
+        metadata.is_none()
+    } else {
+        metadata.as_ref().is_some_and(|existing| {
+            existing.markdown_snapshot == content && Some(&existing.document) == document.as_ref()
+        })
+    };
+    if content == current_markdown && metadata_unchanged {
+        return Ok(current_revision);
+    }
+    let recovery = recovery_directory(&root)?;
+    let prefix = recovery_prefix(&relative_path);
+    let latest_backup_age = fs::read_dir(&recovery)
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(&format!("{prefix}-"))
+                && entry
+                    .path()
+                    .extension()
+                    .is_some_and(|extension| extension == "md")
+        })
+        .filter_map(|entry| entry.metadata().ok()?.modified().ok())
+        .map(|modified| modified.elapsed().unwrap_or_default())
+        .min();
+    let destructive_shrink = current_markdown.len() > content.len().saturating_add(32)
+        && current_markdown.len().saturating_sub(content.len()) > current_markdown.len() / 3;
+    let document_changed = metadata
+        .as_ref()
+        .is_some_and(|existing| Some(&existing.document) != document.as_ref());
+    if (content != current_markdown || document_changed)
+        && (latest_backup_age.is_none_or(|age| age >= std::time::Duration::from_secs(30))
+            || destructive_shrink
+            || document_changed)
+    {
+        write_recovery_copy(
+            &root,
+            &relative_path,
+            &current_markdown,
+            metadata.as_ref(),
+            "saved",
+        )?;
+    }
     if block_document_json.trim().is_empty() {
-        return atomic_write(&path, content.as_bytes());
+        atomic_write(&path, content.as_bytes())?;
+        return Ok(note_revision(&content, None));
     }
     let metadata = BlockDocumentMetadata {
         version: 1,
@@ -1096,6 +1252,50 @@ fn save_note(
     let metadata_path = metadata_path(&root, &relative_path, true)?;
     atomic_write(&metadata_path, &encoded)?;
     atomic_write(&path, content.as_bytes())?;
+    Ok(note_revision(&content, Some(&metadata)))
+}
+
+#[tauri::command]
+fn save_recovery_candidate(
+    vault_path: String,
+    relative_path: String,
+    content: String,
+    block_document_json: String,
+) -> Result<(), String> {
+    let root = canonical_vault(&vault_path)?;
+    let relative = validate_relative_path(&relative_path)?;
+    if relative
+        .extension()
+        .is_none_or(|extension| extension != "md")
+    {
+        return Err("A nota de recuperação precisa ser um arquivo Markdown.".to_string());
+    }
+    let document = if block_document_json.trim().is_empty() {
+        None
+    } else {
+        Some(
+            serde_json::from_str::<serde_json::Value>(&block_document_json)
+                .map_err(|error| format!("A estrutura da recuperação está inválida: {error}"))?,
+        )
+    };
+    let metadata = document.as_ref().map(|document| BlockDocumentMetadata {
+        version: 1,
+        relative_path: relative_path.clone(),
+        markdown_snapshot: content.clone(),
+        document: document.clone(),
+    });
+    write_recovery_copy(
+        &root,
+        &relative_path,
+        &content,
+        metadata.as_ref(),
+        "stale-session",
+    )?;
+    log::warn!(
+        "[save.recovery] stale editor content preserved path={} chars={}",
+        relative_path,
+        content.len()
+    );
     Ok(())
 }
 
@@ -1423,6 +1623,7 @@ pub fn run() {
             read_note,
             rename_note,
             save_note,
+            save_recovery_candidate,
             delete_note,
             delete_notes,
             create_folder,

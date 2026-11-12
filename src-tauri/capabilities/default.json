@@ -12,6 +12,8 @@
     "opener:default",
     "opener:allow-open-path",
     "dialog:allow-open",
-    "log:default"
+    "log:default",
+    "updater:default",
+    "process:allow-restart"
   ]
 }

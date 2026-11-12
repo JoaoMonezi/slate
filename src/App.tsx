@@ -4,6 +4,8 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { openPath } from "@tauri-apps/plugin-opener";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { debug as logDebug, error as logError, info as logInfo } from "@tauri-apps/plugin-log";
+import { check, type Update } from "@tauri-apps/plugin-updater";
+import { relaunch } from "@tauri-apps/plugin-process";
 import { filterSuggestionItems } from "@blocknote/core/extensions";
 import { en, pt } from "@blocknote/core/locales";
 import { BlockNoteView } from "@blocknote/mantine";
@@ -655,6 +657,9 @@ function App() {
   const [renameName, setRenameName] = useState("");
   const [renamingNote, setRenamingNote] = useState(false);
   const [error, setError] = useState("");
+  const [updateStatus, setUpdateStatus] = useState<"idle" | "checking" | "current" | "available" | "installing" | "error">("idle");
+  const [availableUpdate, setAvailableUpdate] = useState<Update | null>(null);
+  const [updateError, setUpdateError] = useState("");
   const [saveStatus, setSaveStatus] = useState<SaveStatus>("saved");
   const [loading, setLoading] = useState(false);
   const startupVault = useRef("");
@@ -688,6 +693,37 @@ function App() {
     setGraphData(nextGraph);
     return nextEntries;
   }, []);
+
+  async function checkForUpdates() {
+    setUpdateStatus("checking");
+    setUpdateError("");
+    setAvailableUpdate(null);
+    try {
+      const update = await check();
+      if (update) {
+        setAvailableUpdate(update);
+        setUpdateStatus("available");
+      } else {
+        setUpdateStatus("current");
+      }
+    } catch (cause) {
+      setUpdateError(String(cause));
+      setUpdateStatus("error");
+    }
+  }
+
+  async function installUpdate() {
+    if (!availableUpdate) return;
+    setUpdateStatus("installing");
+    setUpdateError("");
+    try {
+      await availableUpdate.downloadAndInstall();
+      await relaunch();
+    } catch (cause) {
+      setUpdateError(String(cause));
+      setUpdateStatus("error");
+    }
+  }
 
   const persistNote = useCallback((
     path: string,
@@ -1569,6 +1605,27 @@ function App() {
               >
                 {[14, 16, 18, 20].map((size) => <option key={size} value={size}>{size} px</option>)}
               </select>
+              <div className="settings-update-section">
+                <label>{t("updates")}</label>
+                <button
+                  className="folder-action-button"
+                  onClick={() => void checkForUpdates()}
+                  disabled={updateStatus === "checking" || updateStatus === "installing"}
+                >
+                  {updateStatus === "checking" ? t("checkingUpdates") : t("checkUpdates")}
+                </button>
+                {updateStatus === "current" && <p className="settings-update-message">{t("upToDate")}</p>}
+                {updateStatus === "available" && availableUpdate && (
+                  <div className="settings-update-message">
+                    <p>{t("updateAvailable", { version: availableUpdate.version })}</p>
+                    <button className="folder-action-button" onClick={() => void installUpdate()}>
+                      {t("installUpdate")}
+                    </button>
+                  </div>
+                )}
+                {updateStatus === "installing" && <p className="settings-update-message">{t("installingUpdate")}</p>}
+                {updateStatus === "error" && <p className="settings-update-message update-error">{t("updateError", { error: updateError })}</p>}
+              </div>
             </div>
           </aside>
         )}

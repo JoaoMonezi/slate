@@ -433,7 +433,6 @@ function FolderTree({
                 }}
                 title={t("chooseFolder", { folder: displayFolderName(node.name, language) })}
               >
-                <span className="tree-icon">▱</span>
                 <span>{displayFolderName(node.name, language)}</span>
               </button>
               {node.name.toLocaleLowerCase() === "draft" && (
@@ -1474,34 +1473,6 @@ function App() {
                 ×
               </button>
             </div>
-            <div className="folder-create-row">
-              <input
-                value={newFolderName}
-                onChange={(event) => setNewFolderName(event.currentTarget.value)}
-                placeholder={t("newFolder")}
-                aria-label={t("folderName")}
-                onKeyDown={(event) => {
-                  if (event.key === "Enter") void addFolder();
-                }}
-              />
-              <button className="small-button" onClick={() => void addFolder()} disabled={!newFolderName.trim()}>
-                {t("create")}
-              </button>
-            </div>
-            <FolderTree
-              entries={entries}
-              selectedFolder={selectedFolder}
-              language={language}
-              t={t}
-              onSelectFolder={setSelectedFolder}
-              onCreateDraft={() => void createDraft()}
-              onOpenNote={(path) => void loadNote(path)}
-              onRenameNote={startRenameNote}
-              onDeleteNote={(path) => setDeleteTargets([path])}
-              onNoteContextMenu={openNoteContextMenu}
-              selectedNotes={selectedNotePaths}
-              onToggleSelection={toggleNoteSelection}
-            />
             {selectedNotePaths.size > 0 && (
               <div className="selection-actions">
                 <span className="selection-count">
@@ -1550,6 +1521,34 @@ function App() {
                 )}
               </div>
             )}
+            <div className="folder-create-row">
+              <input
+                value={newFolderName}
+                onChange={(event) => setNewFolderName(event.currentTarget.value)}
+                placeholder={t("newFolder")}
+                aria-label={t("folderName")}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter") void addFolder();
+                }}
+              />
+              <button className="small-button" onClick={() => void addFolder()} disabled={!newFolderName.trim()}>
+                {t("create")}
+              </button>
+            </div>
+            <FolderTree
+              entries={entries}
+              selectedFolder={selectedFolder}
+              language={language}
+              t={t}
+              onSelectFolder={setSelectedFolder}
+              onCreateDraft={() => void createDraft()}
+              onOpenNote={(path) => void loadNote(path)}
+              onRenameNote={startRenameNote}
+              onDeleteNote={(path) => setDeleteTargets([path])}
+              onNoteContextMenu={openNoteContextMenu}
+              selectedNotes={selectedNotePaths}
+              onToggleSelection={toggleNoteSelection}
+            />
             <div className="folder-actions">
               <p className="eyebrow">{t("notesFolder")}</p>
               <button className="folder-action-button" onClick={() => void showNotesFolder()}>

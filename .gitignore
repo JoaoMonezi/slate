@@ -40,4 +40,5 @@ lerna-debug.log*
 *.sw?
 MANUTENCAO_LOCAL.md
 TUTORIAL_APRENDIZADO_LOCAL.md
-BUGS_E_ANOTACOES.md
+# Project management notes (kept local)
+PM/

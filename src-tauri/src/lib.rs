@@ -5,9 +5,13 @@ use std::{
     fs::{self, OpenOptions},
     io::Write,
     path::{Component, Path, PathBuf},
+    sync::Mutex,
     time::{SystemTime, UNIX_EPOCH},
 };
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Emitter, Manager};
+
+#[derive(Default)]
+struct PendingExternalFiles(Mutex<Vec<String>>);
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -23,6 +27,7 @@ struct VaultEntry {
 struct NoteData {
     name: String,
     relative_path: String,
+    external_path: Option<String>,
     content: String,
     revision: String,
     block_document_json: Option<String>,
@@ -342,12 +347,121 @@ fn note_data(root: &Path, path: &Path, content: String) -> Result<NoteData, Stri
     Ok(NoteData {
         name,
         relative_path,
+        external_path: None,
         revision,
         content,
         block_document_json,
         block_document_conflict: conflict,
         block_document_markdown_snapshot,
     })
+}
+
+fn resolve_external_markdown(path: &str) -> Result<PathBuf, String> {
+    let requested = PathBuf::from(path);
+    if !requested
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("md"))
+    {
+        return Err("O Slate só abre arquivos Markdown (.md).".to_string());
+    }
+    let canonical = requested
+        .canonicalize()
+        .map_err(|error| format!("Não foi possível acessar o arquivo Markdown: {error}"))?;
+    if !canonical.is_file() {
+        return Err("O caminho recebido não é um arquivo Markdown.".to_string());
+    }
+    Ok(canonical)
+}
+
+fn external_note_data(path: &Path) -> Result<NoteData, String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| "Não foi possível localizar a pasta do arquivo.".to_string())?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| "Não foi possível identificar o nome do arquivo.".to_string())?;
+    let content = fs::read_to_string(path)
+        .map_err(|error| format!("Não foi possível ler a nota: {error}"))?;
+    let mut note = note_data(parent, path, content)?;
+    let absolute = path.to_string_lossy().to_string();
+    note.name = file_name.to_string();
+    note.relative_path = absolute.clone();
+    note.external_path = Some(absolute);
+    Ok(note)
+}
+
+fn external_path_from_args(args: impl IntoIterator<Item = String>) -> Vec<String> {
+    args.into_iter()
+        .filter_map(|argument| {
+            let path = resolve_external_markdown(&argument).ok()?;
+            Some(path.to_string_lossy().to_string())
+        })
+        .collect()
+}
+
+#[tauri::command]
+fn take_pending_external_files(state: tauri::State<'_, PendingExternalFiles>) -> Vec<String> {
+    state
+        .0
+        .lock()
+        .map(|mut files| std::mem::take(&mut *files))
+        .unwrap_or_default()
+}
+
+#[tauri::command]
+fn read_external_note(path: String) -> Result<NoteData, String> {
+    let path = resolve_external_markdown(&path)?;
+    external_note_data(&path)
+}
+
+#[tauri::command]
+fn save_external_note(
+    path: String,
+    content: String,
+    block_document_json: String,
+    expected_revision: String,
+    conflict_resolution: String,
+) -> Result<String, String> {
+    let path = resolve_external_markdown(&path)?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| "Não foi possível localizar a pasta do arquivo.".to_string())?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| "Não foi possível identificar o nome do arquivo.".to_string())?;
+    save_note(
+        parent.to_string_lossy().to_string(),
+        file_name.to_string(),
+        content,
+        block_document_json,
+        expected_revision,
+        conflict_resolution,
+    )
+}
+
+#[tauri::command]
+fn save_external_recovery_candidate(
+    path: String,
+    content: String,
+    block_document_json: String,
+) -> Result<(), String> {
+    let path = resolve_external_markdown(&path)?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| "Não foi possível localizar a pasta do arquivo.".to_string())?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| "Não foi possível identificar o nome do arquivo.".to_string())?;
+    save_recovery_candidate(
+        parent.to_string_lossy().to_string(),
+        file_name.to_string(),
+        content,
+        block_document_json,
+    )
 }
 
 fn note_revision(content: &str, metadata: Option<&BlockDocumentMetadata>) -> String {
@@ -947,6 +1061,7 @@ fn create_draft(vault_path: String) -> Result<NoteData, String> {
                 return Ok(NoteData {
                     name,
                     relative_path: relative_string(&root, &path)?,
+                    external_path: None,
                     revision: note_revision("", None),
                     content: String::new(),
                     block_document_json: None,
@@ -1604,6 +1719,18 @@ fn search_notes(vault_path: String, query: String) -> Result<Vec<SearchHit>, Str
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
+            let paths = external_path_from_args(argv.into_iter().skip(1));
+            if paths.is_empty() {
+                return;
+            }
+            if let Some(state) = app.try_state::<PendingExternalFiles>() {
+                if let Ok(mut pending) = state.0.lock() {
+                    pending.extend(paths);
+                }
+                let _ = app.emit("open-external-files", ());
+            }
+        }))
         .plugin(
             tauri_plugin_log::Builder::new()
                 .level(log::LevelFilter::Debug)
@@ -1614,7 +1741,10 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
-        .setup(|_| {
+        .setup(|app| {
+            app.manage(PendingExternalFiles(Mutex::new(external_path_from_args(
+                std::env::args().skip(1),
+            ))));
             log::info!("Slate started");
             Ok(())
         })
@@ -1623,9 +1753,13 @@ pub fn run() {
             create_draft,
             list_vault,
             read_note,
+            read_external_note,
+            take_pending_external_files,
             rename_note,
             save_note,
+            save_external_note,
             save_recovery_candidate,
+            save_external_recovery_candidate,
             delete_note,
             delete_notes,
             create_folder,

@@ -10,6 +10,7 @@ export interface VaultEntry {
 export interface ActiveNote {
   name: string;
   relativePath: string;
+  externalPath?: string | null;
   content: string;
   revision: string;
   sessionId?: number;

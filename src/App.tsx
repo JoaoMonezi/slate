@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import { openPath } from "@tauri-apps/plugin-opener";
 import { getCurrentWindow } from "@tauri-apps/api/window";
@@ -367,9 +368,14 @@ function displayNoteName(name: string) {
 }
 
 function displayRelativePath(path: string, language: Language = "pt-BR") {
+  if (isExternalPath(path)) return path;
   return path.split("/").map((part) => part.toLowerCase().endsWith(".md")
     ? displayNoteName(part)
     : displayFolderName(part, language)).join("/");
+}
+
+function isExternalPath(path: string) {
+  return /^[A-Za-z]:[\\/]/.test(path) || path.startsWith("\\\\");
 }
 
 function FolderTree({
@@ -673,6 +679,9 @@ function App() {
   const saveRequestId = useRef(0);
   const closingWindow = useRef(false);
   const blockedSavePaths = useRef(new Set<string>());
+  const externalFilesListenerReady = useRef<Promise<void> | null>(null);
+  const externalFilesTask = useRef<Promise<string[]> | null>(null);
+  const openedExternalFile = useRef(false);
 
   const activeNote = openNotes.find((note) => note.relativePath === activePathKey) ?? null;
   const noteEntries = useMemo(() => flattenNotes(entries), [entries]);
@@ -742,26 +751,42 @@ function App() {
         try {
           const session = noteSessions.current.get(relativePath);
           if (!session || session.id !== sessionId) {
-            await invoke<void>("save_recovery_candidate", {
-              vaultPath: path,
-              relativePath,
-              content,
-              blockDocumentJson,
-            });
+            if (isExternalPath(relativePath)) {
+              await invoke<void>("save_external_recovery_candidate", {
+                path: relativePath,
+                content,
+                blockDocumentJson,
+              });
+            } else {
+              await invoke<void>("save_recovery_candidate", {
+                vaultPath: path,
+                relativePath,
+                content,
+                blockDocumentJson,
+              });
+            }
             throw new Error(`A edição de ${relativePath} já foi substituída por uma versão mais recente. O texto atual foi mantido na recuperação local.`);
           }
           const expectedMarkdownSnapshot = persistedMarkdownByPath.current.get(relativePath);
           if (expectedMarkdownSnapshot === undefined) {
             throw new Error(`Não foi possível validar a versão carregada de ${relativePath}. Reabra a nota antes de salvar.`);
           }
-          const revision = await invoke<string>("save_note", {
-            vaultPath: path,
-            relativePath,
-            content,
-            blockDocumentJson,
-            expectedRevision: session.revision,
-            conflictResolution,
-          });
+          const revision = isExternalPath(relativePath)
+            ? await invoke<string>("save_external_note", {
+                path: relativePath,
+                content,
+                blockDocumentJson,
+                expectedRevision: session.revision,
+                conflictResolution,
+              })
+            : await invoke<string>("save_note", {
+                vaultPath: path,
+                relativePath,
+                content,
+                blockDocumentJson,
+                expectedRevision: session.revision,
+                conflictResolution,
+              });
           if (noteSessions.current.get(relativePath)?.id !== sessionId) {
             throw new Error(`A edição de ${relativePath} mudou durante o salvamento.`);
           }
@@ -899,7 +924,9 @@ function App() {
         if (activePath.current) {
           await persistNote(vaultPath, activePath.current, currentContent.current);
         }
-        const note = await invoke<ActiveNote>("read_note", { vaultPath, relativePath });
+        const note = isExternalPath(relativePath)
+          ? await invoke<ActiveNote>("read_external_note", { path: relativePath })
+          : await invoke<ActiveNote>("read_note", { vaultPath, relativePath });
         selectNoteTab(note);
       } catch (cause) {
         setError(String(cause));
@@ -909,6 +936,68 @@ function App() {
     },
     [persistNote, selectNoteTab, vaultPath],
   );
+
+  const openExternalNote = useCallback(async (path: string) => {
+    setLoading(true);
+    setError("");
+    try {
+      if (activePath.current && vaultPath) {
+        await persistNote(vaultPath, activePath.current, currentContent.current);
+      }
+      const note = await invoke<ActiveNote>("read_external_note", { path });
+      openedExternalFile.current = true;
+      selectNoteTab(note);
+      return note.relativePath;
+    } catch (cause) {
+      setError(String(cause));
+      return "";
+    } finally {
+      setLoading(false);
+    }
+  }, [persistNote, selectNoteTab, vaultPath]);
+
+  const drainPendingExternalFiles = useCallback(() => {
+    if (externalFilesTask.current) return externalFilesTask.current;
+    const task = (async () => {
+      const paths = await invoke<string[]>("take_pending_external_files");
+      const opened: string[] = [];
+      for (const path of paths) {
+        const notePath = await openExternalNote(path);
+        if (notePath) opened.push(notePath);
+      }
+      return opened;
+    })();
+    externalFilesTask.current = task.finally(() => {
+      externalFilesTask.current = null;
+    });
+    return externalFilesTask.current;
+  }, [openExternalNote]);
+
+  useEffect(() => {
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    let resolveReady: (() => void) | undefined;
+    externalFilesListenerReady.current = new Promise<void>((resolve) => {
+      resolveReady = resolve;
+    });
+    void listen("open-external-files", () => {
+      void drainPendingExternalFiles();
+    }).then((stopListening) => {
+      if (disposed) stopListening();
+      else {
+        unlisten = stopListening;
+        resolveReady?.();
+        void drainPendingExternalFiles();
+      }
+    }).catch((cause) => {
+      setError(`Não foi possível preparar a abertura de arquivos externos: ${String(cause)}`);
+      resolveReady?.();
+    });
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, [drainPendingExternalFiles]);
 
   const createDraft = useCallback(
     async (path = vaultPath) => {
@@ -940,7 +1029,10 @@ function App() {
     startupVault.current = vaultPath;
     void (async () => {
       try {
+        await externalFilesListenerReady.current;
+        const externallyOpened = await drainPendingExternalFiles();
         const currentEntries = await refreshTree(vaultPath);
+        if (externallyOpened.length > 0 || openedExternalFile.current) return;
         const existingDraft = findExistingDraft(currentEntries);
         if (existingDraft) {
           setLoading(true);
@@ -962,7 +1054,7 @@ function App() {
         localStorage.removeItem(VAULT_STORAGE_KEY);
       }
     })();
-  }, [createDraft, initializeDefaultVault, refreshTree, selectNoteTab, vaultPath]);
+  }, [createDraft, drainPendingExternalFiles, initializeDefaultVault, refreshTree, selectNoteTab, vaultPath]);
 
   useEffect(() => {
     if (!vaultPath || !searchOpen || !searchQuery.trim()) {
@@ -1202,6 +1294,7 @@ function App() {
   }
 
   function openNoteContextMenu(path: string, x: number, y: number) {
+    if (isExternalPath(path)) return;
     setNoteContextMenu({
       path,
       x: Math.min(x, window.innerWidth - 190),
@@ -1210,6 +1303,7 @@ function App() {
   }
 
   function startRenameNote(path: string) {
+    if (isExternalPath(path)) return;
     const name = openNotes.find((note) => note.relativePath === path)?.name
       ?? noteEntries.find((note) => note.relativePath === path)?.name
       ?? path.split("/").pop()
@@ -1426,7 +1520,7 @@ function App() {
               key={note.relativePath}
               onContextMenu={(event) => {
                 event.preventDefault();
-                openNoteContextMenu(note.relativePath, event.clientX, event.clientY);
+                if (!note.externalPath) openNoteContextMenu(note.relativePath, event.clientX, event.clientY);
               }}
             >
               <button
@@ -1434,7 +1528,7 @@ function App() {
                 role="tab"
                 aria-selected={activePathKey === note.relativePath}
                 onClick={() => void loadNote(note.relativePath)}
-                onDoubleClick={() => startRenameNote(note.relativePath)}
+                onDoubleClick={() => { if (!note.externalPath) startRenameNote(note.relativePath); }}
                 title={displayRelativePath(note.relativePath, language)}
               >
                 {tabLabel(note)}
@@ -1447,14 +1541,16 @@ function App() {
               >
                 ×
               </button>
-              <button
-                className="note-tab-delete"
-                onClick={() => setDeleteTargets([note.relativePath])}
-                aria-label={t("fileDeletedAria", { name: tabLabel(note) })}
-                title={t("deleteFile")}
-              >
-                <TrashIcon />
-              </button>
+              {!note.externalPath && (
+                <button
+                  className="note-tab-delete"
+                  onClick={() => setDeleteTargets([note.relativePath])}
+                  aria-label={t("fileDeletedAria", { name: tabLabel(note) })}
+                  title={t("deleteFile")}
+                >
+                  <TrashIcon />
+                </button>
+              )}
             </div>
           ))}
           <button className="new-tab-button" onClick={() => void createDraft()} aria-label={t("createDraft")} title={t("newDraft")}>
@@ -1499,7 +1595,7 @@ function App() {
                 </div>
               </div>
             )}
-            {activeNote && selectedNotePaths.size === 0 && (
+            {activeNote && !activeNote.externalPath && selectedNotePaths.size === 0 && (
               <div className="organize-box">
                 <label className="organize-label" htmlFor="organize-target">{t("moveNoteTo")}</label>
                 <select

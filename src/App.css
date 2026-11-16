@@ -1220,6 +1220,18 @@
   box-shadow: 0 12px 35px rgba(30, 30, 28, 0.15);
 }
 
+.revision-conflict-dialog {
+  width: min(100%, 520px);
+}
+
+.revision-conflict-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 18px;
+}
+
 .rename-dialog h2 {
   margin: 0 0 8px;
   font-size: 17px;

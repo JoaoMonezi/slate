@@ -378,6 +378,11 @@ function isExternalPath(path: string) {
   return /^[A-Za-z]:[\\/]/.test(path) || path.startsWith("\\\\");
 }
 
+function isRevisionConflictError(cause: unknown) {
+  const message = String(cause).toLocaleLowerCase();
+  return message.includes("alterada fora do slate") || message.includes("changed outside slate");
+}
+
 function FolderTree({
   entries,
   selectedFolder,
@@ -666,6 +671,8 @@ function App() {
   const [availableUpdate, setAvailableUpdate] = useState<Update | null>(null);
   const [updateError, setUpdateError] = useState("");
   const [saveStatus, setSaveStatus] = useState<SaveStatus>("saved");
+  const [revisionConflictPath, setRevisionConflictPath] = useState("");
+  const [resolvingRevisionConflict, setResolvingRevisionConflict] = useState(false);
   const [loading, setLoading] = useState(false);
   const startupVault = useRef("");
   const initializingVault = useRef(false);
@@ -808,6 +815,11 @@ function App() {
           if (requestId === saveRequestId.current) setSaveStatus("saved");
         } catch (cause) {
           void logError(`[save.error] path=${relativePath} error=${String(cause)}`).catch(() => undefined);
+          if (isRevisionConflictError(cause)) {
+            blockedSavePaths.current.add(relativePath);
+            setRevisionConflictPath(relativePath);
+            setError("");
+          }
           if (requestId === saveRequestId.current) setSaveStatus("error");
           throw cause;
         }
@@ -1127,7 +1139,18 @@ function App() {
   }
 
   async function saveMarkdown(relativePath: string, content: string, blockDocumentJson: string, sessionId: number) {
-    if (!vaultPath || !relativePath || blockedSavePaths.current.has(relativePath)) return;
+    if (!vaultPath || !relativePath) return;
+    if (blockedSavePaths.current.has(relativePath)) {
+      if (revisionConflictPath === relativePath) {
+        try {
+          await writeRecoveryCandidate(relativePath, content, blockDocumentJson);
+          setSaveStatus("error");
+        } catch (cause) {
+          setError(String(cause));
+        }
+      }
+      return;
+    }
     if (activePath.current === relativePath) {
       currentContent.current = content;
       currentBlockDocumentJson.current = blockDocumentJson;
@@ -1158,6 +1181,64 @@ function App() {
     currentContent.current = content;
     currentBlockDocumentJson.current = blockDocumentJson;
     await persistNote(vaultPath, relativePath, content, blockDocumentJson, resolution, sessionId);
+  }
+
+  async function writeRecoveryCandidate(relativePath: string, content: string, blockDocumentJson: string) {
+    if (isExternalPath(relativePath)) {
+      await invoke<void>("save_external_recovery_candidate", {
+        path: relativePath,
+        content,
+        blockDocumentJson,
+      });
+    } else {
+      await invoke<void>("save_recovery_candidate", {
+        vaultPath,
+        relativePath,
+        content,
+        blockDocumentJson,
+      });
+    }
+  }
+
+  async function keepDiskVersion() {
+    const relativePath = revisionConflictPath;
+    if (!relativePath || resolvingRevisionConflict) return;
+    setResolvingRevisionConflict(true);
+    setError("");
+    try {
+      await writeRecoveryCandidate(relativePath, currentContent.current, currentBlockDocumentJson.current);
+      const note = isExternalPath(relativePath)
+        ? await invoke<ActiveNote>("read_external_note", { path: relativePath })
+        : await invoke<ActiveNote>("read_note", { vaultPath, relativePath });
+      selectNoteTab(note);
+      setRevisionConflictPath("");
+      setSaveStatus("saved");
+    } catch (cause) {
+      setError(String(cause));
+    } finally {
+      setResolvingRevisionConflict(false);
+    }
+  }
+
+  async function overwriteDiskWithSlateVersion() {
+    const relativePath = revisionConflictPath;
+    if (!relativePath || resolvingRevisionConflict) return;
+    const sessionId = noteSessions.current.get(relativePath)?.id;
+    setResolvingRevisionConflict(true);
+    setError("");
+    try {
+      const content = currentContent.current;
+      const blockDocumentJson = currentBlockDocumentJson.current;
+      await writeRecoveryCandidate(relativePath, content, blockDocumentJson);
+      await persistNote(vaultPath, relativePath, content, blockDocumentJson, "use-current-markdown", sessionId);
+      blockedSavePaths.current.delete(relativePath);
+      setRevisionConflictPath("");
+      setError("");
+    } catch (cause) {
+      if (!isRevisionConflictError(cause)) setError(String(cause));
+    } finally {
+      setResolvingRevisionConflict(false);
+    }
   }
 
   async function organizeNote() {
@@ -1831,7 +1912,7 @@ function App() {
               )}
             </div>
           )}
-          {error && (
+          {error && !revisionConflictPath && (
             <div className="toast-error" role="alert">
               <span>{localizeError(error, language)}</span>
               <button className="icon-button" onClick={() => setError("")} aria-label={t("errorClose")}>×</button>
@@ -1839,6 +1920,22 @@ function App() {
           )}
         </section>
       </div>
+      {revisionConflictPath && (
+        <div className="rename-backdrop" role="presentation">
+          <section className="rename-dialog revision-conflict-dialog" role="alertdialog" aria-modal="true" aria-labelledby="revision-conflict-title">
+            <h2 id="revision-conflict-title">{t("revisionConflictTitle")}</h2>
+            <p>{t("revisionConflictMessage")}</p>
+            <div className="revision-conflict-actions">
+              <button className="cancel-button" onClick={() => void keepDiskVersion()} disabled={resolvingRevisionConflict}>
+                {resolvingRevisionConflict ? t("resolvingConflict") : t("keepDiskVersion")}
+              </button>
+              <button className="primary-button" onClick={() => void overwriteDiskWithSlateVersion()} disabled={resolvingRevisionConflict}>
+                {resolvingRevisionConflict ? t("resolvingConflict") : t("overwriteWithSlate")}
+              </button>
+            </div>
+          </section>
+        </div>
+      )}
       {noteContextMenu && (
         <div
           className="note-context-menu"

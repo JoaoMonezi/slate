@@ -1974,7 +1974,8 @@ function App() {
                 pathKey={activeNote.relativePath}
                 text={activeNote.content}
                 sessionId={activeNote.sessionId ?? 0}
-                onSave={saveMarkdown}
+                onSave={(content, path, blockDocumentJson, sessionId) =>
+                  void saveMarkdown(path, content, blockDocumentJson, sessionId)}
                 onDraft={(content, blockDocumentJson, hasUnsavedChanges) => {
                   currentContent.current = content;
                   currentBlockDocumentJson.current = blockDocumentJson;

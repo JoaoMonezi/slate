@@ -605,6 +605,31 @@ fn save_external_text_recovery_candidate(path: String, content: String) -> Resul
     Ok(())
 }
 
+#[tauri::command]
+fn save_text_recovery_candidate(
+    vault_path: String,
+    relative_path: String,
+    content: String,
+) -> Result<(), String> {
+    let root = canonical_vault(&vault_path)?;
+    let relative = validate_relative_path(&relative_path)?;
+    if !relative
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("txt"))
+    {
+        return Err("A cópia de recuperação de texto precisa ser .txt.".to_string());
+    }
+    let path = root
+        .join(&relative)
+        .canonicalize()
+        .map_err(|error| format!("Não foi possível acessar o arquivo de texto: {error}"))?;
+    if !path.starts_with(&root) || !path.is_file() {
+        return Err("O arquivo de texto precisa estar dentro da pasta de notas.".to_string());
+    }
+    write_text_recovery_copy(&root, &relative_path, content.as_bytes(), "stale-session")
+}
+
 fn note_revision(content: &str, metadata: Option<&BlockDocumentMetadata>) -> String {
     let mut hasher = Sha256::new();
     hasher.update(content.as_bytes());
@@ -827,7 +852,21 @@ fn write_text_recovery_copy(
         .unwrap_or_default()
         .as_nanos();
     let stem = format!("{prefix}-{label}-{timestamp}");
-    atomic_write(&directory.join(format!("{stem}.txt")), content)?;
+    let text = decode_plain_text(content)
+        .map(|(text, _)| normalize_line_endings(&text))
+        .unwrap_or_else(|_| String::from_utf8_lossy(content).into_owned());
+    let longest_backtick_run = text
+        .split('`')
+        .fold((0usize, 0usize), |(longest, current), part| {
+            let next = if part.is_empty() { current + 1 } else { 0 };
+            (longest.max(next), next)
+        })
+        .0;
+    let fence = "`".repeat(longest_backtick_run.max(2) + 1);
+    let markdown = format!(
+        "# Cópia de recuperação\n\nArquivo de origem: `{relative_path}`\n\n{fence}text\n{text}\n{fence}\n"
+    );
+    atomic_write(&directory.join(format!("{stem}.md")), markdown.as_bytes())?;
     let info = serde_json::to_vec_pretty(&RecoveryInfo {
         relative_path: relative_path.to_string(),
         label: label.to_string(),
@@ -847,7 +886,7 @@ fn write_text_recovery_copy(
                 && entry
                     .path()
                     .extension()
-                    .is_some_and(|extension| extension == "txt")
+                    .is_some_and(|extension| extension == "md")
         })
         .collect::<Vec<_>>();
     snapshots.sort_by_key(|entry| {
@@ -857,9 +896,10 @@ fn write_text_recovery_copy(
             .unwrap_or(UNIX_EPOCH)
     });
     for old in snapshots.into_iter().rev().skip(20) {
-        let info_path = old.path().with_extension("info.json");
+        let old_stem = old.path().with_extension("");
         let _ = fs::remove_file(old.path());
-        let _ = fs::remove_file(info_path);
+        let _ = fs::remove_file(old_stem.with_extension("info.json"));
+        let _ = fs::remove_file(old_stem.with_extension("json"));
     }
     Ok(())
 }
@@ -885,7 +925,7 @@ fn should_keep_text_backup(
                 && entry
                     .path()
                     .extension()
-                    .is_some_and(|extension| extension == "txt")
+                    .is_some_and(|extension| extension == "md")
         })
         .filter_map(|entry| entry.metadata().ok()?.modified().ok())
         .map(|modified| modified.elapsed().unwrap_or_default())
@@ -2097,6 +2137,7 @@ pub fn run() {
             save_recovery_candidate,
             save_external_recovery_candidate,
             save_external_text_recovery_candidate,
+            save_text_recovery_candidate,
             delete_note,
             delete_notes,
             create_folder,

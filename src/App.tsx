@@ -380,7 +380,11 @@ function isExternalPath(path: string) {
 }
 
 function isExternalTextPath(path: string) {
-  return isExternalPath(path) && path.toLocaleLowerCase().endsWith(".txt");
+  return isExternalPath(path) && isPlainTextPath(path);
+}
+
+function isPlainTextPath(path: string) {
+  return path.toLocaleLowerCase().endsWith(".txt");
 }
 
 function PlainTextEditor({
@@ -813,6 +817,12 @@ function App() {
             if (isExternalTextPath(relativePath)) {
               await invoke<void>("save_external_text_recovery_candidate", {
                 path: relativePath,
+                content,
+              });
+            } else if (isPlainTextPath(relativePath)) {
+              await invoke<void>("save_text_recovery_candidate", {
+                vaultPath: path,
+                relativePath,
                 content,
               });
             } else if (isExternalPath(relativePath)) {
@@ -1262,6 +1272,12 @@ function App() {
     if (isExternalTextPath(relativePath)) {
       await invoke<void>("save_external_text_recovery_candidate", {
         path: relativePath,
+        content,
+      });
+    } else if (isPlainTextPath(relativePath)) {
+      await invoke<void>("save_text_recovery_candidate", {
+        vaultPath,
+        relativePath,
         content,
       });
     } else if (isExternalPath(relativePath)) {

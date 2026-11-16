@@ -4,6 +4,7 @@ import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import { openPath } from "@tauri-apps/plugin-opener";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { LogicalSize } from "@tauri-apps/api/dpi";
 import { debug as logDebug, error as logError, info as logInfo } from "@tauri-apps/plugin-log";
 import { check, type Update } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
@@ -378,9 +379,60 @@ function isExternalPath(path: string) {
   return /^[A-Za-z]:[\\/]/.test(path) || path.startsWith("\\\\");
 }
 
+function isExternalTextPath(path: string) {
+  return isExternalPath(path) && path.toLocaleLowerCase().endsWith(".txt");
+}
+
+function PlainTextEditor({
+  pathKey,
+  text,
+  sessionId,
+  onSave,
+  onDraft,
+}: {
+  pathKey: string;
+  text: string;
+  sessionId: number;
+  onSave: (value: string, path: string, blockDocumentJson: string, sessionId: number) => void;
+  onDraft: (value: string, blockDocumentJson: string, hasUnsavedChanges: boolean) => void;
+}) {
+  const [value, setValue] = useState(text);
+  const timer = useRef<number | undefined>(undefined);
+
+  useEffect(() => {
+    if (timer.current !== undefined) window.clearTimeout(timer.current);
+    timer.current = undefined;
+    setValue(text);
+  }, [pathKey, sessionId, text]);
+
+  useEffect(() => () => {
+    if (timer.current !== undefined) window.clearTimeout(timer.current);
+  }, []);
+
+  function updateText(next: string) {
+    setValue(next);
+    onDraft(next, "", true);
+    if (timer.current !== undefined) window.clearTimeout(timer.current);
+    timer.current = window.setTimeout(() => onSave(next, pathKey, "", sessionId), 350);
+  }
+
+  return (
+    <textarea
+      className="plain-text-editor"
+      value={value}
+      onChange={(event) => updateText(event.currentTarget.value)}
+      aria-label={pathKey.split(/[\\/]/).pop() ?? "Text file"}
+      spellCheck={false}
+      wrap="soft"
+    />
+  );
+}
+
 function isRevisionConflictError(cause: unknown) {
   const message = String(cause).toLocaleLowerCase();
-  return message.includes("alterada fora do slate") || message.includes("changed outside slate");
+  return message.includes("alterada fora do slate")
+    || message.includes("alterado fora do slate")
+    || message.includes("changed outside slate");
 }
 
 function FolderTree({
@@ -758,7 +810,12 @@ function App() {
         try {
           const session = noteSessions.current.get(relativePath);
           if (!session || session.id !== sessionId) {
-            if (isExternalPath(relativePath)) {
+            if (isExternalTextPath(relativePath)) {
+              await invoke<void>("save_external_text_recovery_candidate", {
+                path: relativePath,
+                content,
+              });
+            } else if (isExternalPath(relativePath)) {
               await invoke<void>("save_external_recovery_candidate", {
                 path: relativePath,
                 content,
@@ -778,7 +835,14 @@ function App() {
           if (expectedMarkdownSnapshot === undefined) {
             throw new Error(`Não foi possível validar a versão carregada de ${relativePath}. Reabra a nota antes de salvar.`);
           }
-          const revision = isExternalPath(relativePath)
+          const revision = isExternalTextPath(relativePath)
+            ? await invoke<string>("save_external_text_note", {
+                path: relativePath,
+                content,
+                expectedRevision: session.revision,
+                conflictResolution,
+              })
+            : isExternalPath(relativePath)
             ? await invoke<string>("save_external_note", {
                 path: relativePath,
                 content,
@@ -936,8 +1000,10 @@ function App() {
         if (activePath.current) {
           await persistNote(vaultPath, activePath.current, currentContent.current);
         }
-        const note = isExternalPath(relativePath)
-          ? await invoke<ActiveNote>("read_external_note", { path: relativePath })
+        const note = isExternalTextPath(relativePath)
+          ? await invoke<ActiveNote>("read_external_text_note", { path: relativePath })
+          : isExternalPath(relativePath)
+            ? await invoke<ActiveNote>("read_external_note", { path: relativePath })
           : await invoke<ActiveNote>("read_note", { vaultPath, relativePath });
         selectNoteTab(note);
       } catch (cause) {
@@ -956,7 +1022,16 @@ function App() {
       if (activePath.current && vaultPath) {
         await persistNote(vaultPath, activePath.current, currentContent.current);
       }
-      const note = await invoke<ActiveNote>("read_external_note", { path });
+      const note = isExternalTextPath(path)
+        ? await invoke<ActiveNote>("read_external_text_note", { path })
+        : await invoke<ActiveNote>("read_external_note", { path });
+      const currentWindow = getCurrentWindow();
+      if (await currentWindow.isMaximized()) {
+        await currentWindow.unmaximize();
+        await currentWindow.setSize(new LogicalSize(900, 700));
+      }
+      await currentWindow.center();
+      await currentWindow.setFocus();
       openedExternalFile.current = true;
       selectNoteTab(note);
       return note.relativePath;
@@ -1161,7 +1236,7 @@ function App() {
       setError(String(cause));
       return;
     }
-    try {
+    if (!isExternalPath(relativePath)) try {
       setGraphData(await invoke<GraphData>("get_graph_data", { vaultPath }));
     } catch (cause) {
       if (searchOpen && searchMode === "tree") {
@@ -1184,7 +1259,12 @@ function App() {
   }
 
   async function writeRecoveryCandidate(relativePath: string, content: string, blockDocumentJson: string) {
-    if (isExternalPath(relativePath)) {
+    if (isExternalTextPath(relativePath)) {
+      await invoke<void>("save_external_text_recovery_candidate", {
+        path: relativePath,
+        content,
+      });
+    } else if (isExternalPath(relativePath)) {
       await invoke<void>("save_external_recovery_candidate", {
         path: relativePath,
         content,
@@ -1207,8 +1287,10 @@ function App() {
     setError("");
     try {
       await writeRecoveryCandidate(relativePath, currentContent.current, currentBlockDocumentJson.current);
-      const note = isExternalPath(relativePath)
-        ? await invoke<ActiveNote>("read_external_note", { path: relativePath })
+      const note = isExternalTextPath(relativePath)
+        ? await invoke<ActiveNote>("read_external_text_note", { path: relativePath })
+        : isExternalPath(relativePath)
+          ? await invoke<ActiveNote>("read_external_note", { path: relativePath })
         : await invoke<ActiveNote>("read_note", { vaultPath, relativePath });
       selectNoteTab(note);
       setRevisionConflictPath("");
@@ -1870,7 +1952,20 @@ function App() {
 
         <section className="note-stage">
           {activeNote ? (
-            <>
+            activeNote.isPlainText ? (
+              <PlainTextEditor
+                key={language}
+                pathKey={activeNote.relativePath}
+                text={activeNote.content}
+                sessionId={activeNote.sessionId ?? 0}
+                onSave={saveMarkdown}
+                onDraft={(content, blockDocumentJson, hasUnsavedChanges) => {
+                  currentContent.current = content;
+                  currentBlockDocumentJson.current = blockDocumentJson;
+                  if (hasUnsavedChanges) setSaveStatus("saving");
+                }}
+              />
+            ) : (
               <NoteEditor
                 key={language}
                 pathKey={activeNote.relativePath}
@@ -1897,7 +1992,7 @@ function App() {
                   if (hasUnsavedChanges) setSaveStatus("saving");
                 }}
               />
-            </>
+            )
           ) : (
             <div className="empty-state">
               {error ? (

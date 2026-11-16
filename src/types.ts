@@ -11,6 +11,7 @@ export interface ActiveNote {
   name: string;
   relativePath: string;
   externalPath?: string | null;
+  isPlainText?: boolean;
   content: string;
   revision: string;
   sessionId?: number;

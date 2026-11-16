@@ -1,3 +1,4 @@
+use encoding_rs::WINDOWS_1252;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -28,6 +29,7 @@ struct NoteData {
     name: String,
     relative_path: String,
     external_path: Option<String>,
+    is_plain_text: bool,
     content: String,
     revision: String,
     block_document_json: Option<String>,
@@ -348,6 +350,7 @@ fn note_data(root: &Path, path: &Path, content: String) -> Result<NoteData, Stri
         name,
         relative_path,
         external_path: None,
+        is_plain_text: false,
         revision,
         content,
         block_document_json,
@@ -374,6 +377,42 @@ fn resolve_external_markdown(path: &str) -> Result<PathBuf, String> {
     Ok(canonical)
 }
 
+fn resolve_external_text(path: &str) -> Result<PathBuf, String> {
+    let requested = PathBuf::from(path);
+    if !requested
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("txt"))
+    {
+        return Err("O Slate só abre arquivos de texto (.txt) nesse modo.".to_string());
+    }
+    let canonical = requested
+        .canonicalize()
+        .map_err(|error| format!("Não foi possível acessar o arquivo de texto: {error}"))?;
+    if !canonical.is_file() {
+        return Err("O caminho recebido não é um arquivo de texto.".to_string());
+    }
+    Ok(canonical)
+}
+
+fn resolve_external_file(path: &str) -> Result<PathBuf, String> {
+    let requested = PathBuf::from(path);
+    let extension = requested
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .ok_or_else(|| "O Slate só abre arquivos .md e .txt pelo Explorer.".to_string())?;
+    if !extension.eq_ignore_ascii_case("md") && !extension.eq_ignore_ascii_case("txt") {
+        return Err("O Slate só abre arquivos .md e .txt pelo Explorer.".to_string());
+    }
+    let canonical = requested
+        .canonicalize()
+        .map_err(|error| format!("Não foi possível acessar o arquivo: {error}"))?;
+    if !canonical.is_file() {
+        return Err("O caminho recebido não é um arquivo.".to_string());
+    }
+    Ok(canonical)
+}
+
 fn external_note_data(path: &Path) -> Result<NoteData, String> {
     let parent = path
         .parent()
@@ -395,7 +434,7 @@ fn external_note_data(path: &Path) -> Result<NoteData, String> {
 fn external_path_from_args(args: impl IntoIterator<Item = String>) -> Vec<String> {
     args.into_iter()
         .filter_map(|argument| {
-            let path = resolve_external_markdown(&argument).ok()?;
+            let path = resolve_external_file(&argument).ok()?;
             Some(path.to_string_lossy().to_string())
         })
         .collect()
@@ -414,6 +453,32 @@ fn take_pending_external_files(state: tauri::State<'_, PendingExternalFiles>) ->
 fn read_external_note(path: String) -> Result<NoteData, String> {
     let path = resolve_external_markdown(&path)?;
     external_note_data(&path)
+}
+
+#[tauri::command]
+fn read_external_text_note(path: String) -> Result<NoteData, String> {
+    let path = resolve_external_text(&path)?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| "Não foi possível identificar o nome do arquivo.".to_string())?
+        .to_string();
+    let bytes = fs::read(&path)
+        .map_err(|error| format!("Não foi possível ler o arquivo de texto: {error}"))?;
+    let (text, _) = decode_plain_text(&bytes)?;
+    let content = normalize_line_endings(&text);
+    let absolute = path.to_string_lossy().to_string();
+    Ok(NoteData {
+        name,
+        relative_path: absolute.clone(),
+        external_path: Some(absolute),
+        is_plain_text: true,
+        content,
+        revision: text_file_revision(&bytes),
+        block_document_json: None,
+        block_document_conflict: false,
+        block_document_markdown_snapshot: None,
+    })
 }
 
 #[tauri::command]
@@ -464,6 +529,82 @@ fn save_external_recovery_candidate(
     )
 }
 
+#[tauri::command]
+fn save_external_text_note(
+    path: String,
+    content: String,
+    expected_revision: String,
+    conflict_resolution: String,
+) -> Result<String, String> {
+    let path = resolve_external_text(&path)?;
+    let root = path
+        .parent()
+        .ok_or_else(|| "Não foi possível localizar a pasta do arquivo.".to_string())?;
+    let relative_path = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| "Não foi possível identificar o nome do arquivo.".to_string())?;
+    let current_bytes = fs::read(&path)
+        .map_err(|error| format!("Não foi possível conferir a versão atual do arquivo: {error}"))?;
+    let current_revision = text_file_revision(&current_bytes);
+    let has_conflict = current_revision != expected_revision;
+    if has_conflict {
+        if conflict_resolution == "none" {
+            write_text_recovery_copy(root, relative_path, &current_bytes, "disk")?;
+            let candidate = normalize_line_endings(&content).into_bytes();
+            write_text_recovery_copy(root, relative_path, &candidate, "unsaved")?;
+            return Err("O arquivo foi alterado fora do Slate desde a última abertura. Escolha qual versão deseja manter.".to_string());
+        }
+        if conflict_resolution != "use-current-markdown" {
+            return Err("A resolução do conflito não é válida.".to_string());
+        }
+        write_text_recovery_copy(root, relative_path, &current_bytes, "before-resolution")?;
+    }
+    let (current_text, encoding) = decode_plain_text(&current_bytes)?;
+    let line_ending = detect_line_ending(&current_text);
+    let next_text = apply_line_ending(&content, line_ending);
+    let next_bytes = match encode_plain_text(&next_text, encoding) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            write_text_recovery_copy(
+                root,
+                relative_path,
+                normalize_line_endings(&content).as_bytes(),
+                "encoding-error",
+            )?;
+            return Err(error);
+        }
+    };
+    if next_bytes != current_bytes {
+        if !has_conflict
+            && should_keep_text_backup(root, relative_path, &current_bytes, &next_bytes)?
+        {
+            write_text_recovery_copy(root, relative_path, &current_bytes, "saved")?;
+        }
+        atomic_write(&path, &next_bytes)?;
+    }
+    Ok(text_file_revision(&next_bytes))
+}
+
+#[tauri::command]
+fn save_external_text_recovery_candidate(path: String, content: String) -> Result<(), String> {
+    let path = resolve_external_text(&path)?;
+    let root = path
+        .parent()
+        .ok_or_else(|| "Não foi possível localizar a pasta do arquivo.".to_string())?;
+    let relative_path = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| "Não foi possível identificar o nome do arquivo.".to_string())?;
+    write_text_recovery_copy(
+        root,
+        relative_path,
+        normalize_line_endings(&content).as_bytes(),
+        "stale-session",
+    )?;
+    Ok(())
+}
+
 fn note_revision(content: &str, metadata: Option<&BlockDocumentMetadata>) -> String {
     let mut hasher = Sha256::new();
     hasher.update(content.as_bytes());
@@ -475,6 +616,114 @@ fn note_revision(content: &str, metadata: Option<&BlockDocumentMetadata>) -> Str
     }
     hasher
         .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn decode_plain_text(bytes: &[u8]) -> Result<(String, &'static str), String> {
+    if let Some(content) = bytes.strip_prefix(&[0xef, 0xbb, 0xbf]) {
+        return std::str::from_utf8(content)
+            .map(|text| (text.to_string(), "utf-8-bom"))
+            .map_err(|error| format!("O arquivo tem UTF-8 inválido: {error}"));
+    }
+    if let Some(content) = bytes.strip_prefix(&[0xff, 0xfe]) {
+        if content.len() % 2 != 0 {
+            return Err("O arquivo UTF-16 tem um byte incompleto no final.".to_string());
+        }
+        let units = content
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect::<Vec<_>>();
+        return String::from_utf16(&units)
+            .map(|text| (text, "utf-16le"))
+            .map_err(|error| format!("O arquivo UTF-16 tem uma sequência inválida: {error}"));
+    }
+    if let Some(content) = bytes.strip_prefix(&[0xfe, 0xff]) {
+        if content.len() % 2 != 0 {
+            return Err("O arquivo UTF-16 tem um byte incompleto no final.".to_string());
+        }
+        let units = content
+            .chunks_exact(2)
+            .map(|pair| u16::from_be_bytes([pair[0], pair[1]]))
+            .collect::<Vec<_>>();
+        return String::from_utf16(&units)
+            .map(|text| (text, "utf-16be"))
+            .map_err(|error| format!("O arquivo UTF-16 tem uma sequência inválida: {error}"));
+    }
+    if let Ok(text) = std::str::from_utf8(bytes) {
+        return Ok((text.to_string(), "utf-8"));
+    }
+    if bytes.contains(&0) {
+        return Err("O arquivo selecionado parece binário, não texto puro.".to_string());
+    }
+    let (text, _, had_errors) = WINDOWS_1252.decode(bytes);
+    if had_errors {
+        return Err(
+            "Não foi possível decodificar o arquivo como UTF-8, UTF-16 ou Windows-1252."
+                .to_string(),
+        );
+    }
+    Ok((text.into_owned(), "windows-1252"))
+}
+
+fn encode_plain_text(text: &str, encoding: &str) -> Result<Vec<u8>, String> {
+    match encoding {
+        "utf-8" => Ok(text.as_bytes().to_vec()),
+        "utf-8-bom" => {
+            let mut bytes = vec![0xef, 0xbb, 0xbf];
+            bytes.extend_from_slice(text.as_bytes());
+            Ok(bytes)
+        }
+        "utf-16le" | "utf-16be" => {
+            let mut bytes = if encoding == "utf-16le" {
+                vec![0xff, 0xfe]
+            } else {
+                vec![0xfe, 0xff]
+            };
+            for unit in text.encode_utf16() {
+                let pair = if encoding == "utf-16le" {
+                    unit.to_le_bytes()
+                } else {
+                    unit.to_be_bytes()
+                };
+                bytes.extend_from_slice(&pair);
+            }
+            Ok(bytes)
+        }
+        "windows-1252" => {
+            let (bytes, _, had_errors) = WINDOWS_1252.encode(text);
+            if had_errors {
+                return Err("O texto contém caracteres que não cabem na codificação Windows-1252 deste arquivo.".to_string());
+            }
+            Ok(bytes.into_owned())
+        }
+        _ => Err("A codificação do arquivo de texto não é reconhecida.".to_string()),
+    }
+}
+
+fn detect_line_ending(text: &str) -> &'static str {
+    if text.contains("\r\n") {
+        "\r\n"
+    } else if text.contains('\r') {
+        "\r"
+    } else if text.contains('\n') {
+        "\n"
+    } else {
+        "\r\n"
+    }
+}
+
+fn normalize_line_endings(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\r', "\n")
+}
+
+fn apply_line_ending(text: &str, line_ending: &str) -> String {
+    normalize_line_endings(text).replace('\n', line_ending)
+}
+
+fn text_file_revision(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
@@ -563,6 +812,90 @@ fn write_recovery_copy(
         let _ = fs::remove_file(old_stem.with_extension("info.json"));
     }
     Ok(())
+}
+
+fn write_text_recovery_copy(
+    root: &Path,
+    relative_path: &str,
+    content: &[u8],
+    label: &str,
+) -> Result<(), String> {
+    let directory = recovery_directory(root)?;
+    let prefix = recovery_prefix(relative_path);
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let stem = format!("{prefix}-{label}-{timestamp}");
+    atomic_write(&directory.join(format!("{stem}.txt")), content)?;
+    let info = serde_json::to_vec_pretty(&RecoveryInfo {
+        relative_path: relative_path.to_string(),
+        label: label.to_string(),
+        timestamp_nanos: timestamp,
+    })
+    .map_err(|error| format!("Não foi possível registrar a cópia de recuperação: {error}"))?;
+    atomic_write(&directory.join(format!("{stem}.info.json")), &info)?;
+
+    let mut snapshots = fs::read_dir(&directory)
+        .map_err(|error| format!("Não foi possível listar a recuperação local: {error}"))?
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(&format!("{prefix}-"))
+                && entry
+                    .path()
+                    .extension()
+                    .is_some_and(|extension| extension == "txt")
+        })
+        .collect::<Vec<_>>();
+    snapshots.sort_by_key(|entry| {
+        entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .unwrap_or(UNIX_EPOCH)
+    });
+    for old in snapshots.into_iter().rev().skip(20) {
+        let info_path = old.path().with_extension("info.json");
+        let _ = fs::remove_file(old.path());
+        let _ = fs::remove_file(info_path);
+    }
+    Ok(())
+}
+
+fn should_keep_text_backup(
+    root: &Path,
+    relative_path: &str,
+    current: &[u8],
+    next: &[u8],
+) -> Result<bool, String> {
+    let directory = recovery_directory(root)?;
+    let prefix = recovery_prefix(relative_path);
+    let latest_backup_age = fs::read_dir(&directory)
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(&format!("{prefix}-"))
+                && entry
+                    .path()
+                    .extension()
+                    .is_some_and(|extension| extension == "txt")
+        })
+        .filter_map(|entry| entry.metadata().ok()?.modified().ok())
+        .map(|modified| modified.elapsed().unwrap_or_default())
+        .min();
+    let destructive_shrink = current.len() > next.len().saturating_add(32)
+        && current.len().saturating_sub(next.len()) > current.len() / 3;
+    Ok(
+        latest_backup_age.is_none_or(|age| age >= std::time::Duration::from_secs(30))
+            || destructive_shrink,
+    )
 }
 
 fn relocate_block_metadata(
@@ -1062,6 +1395,7 @@ fn create_draft(vault_path: String) -> Result<NoteData, String> {
                     name,
                     relative_path: relative_string(&root, &path)?,
                     external_path: None,
+                    is_plain_text: false,
                     revision: note_revision("", None),
                     content: String::new(),
                     block_document_json: None,
@@ -1754,12 +2088,15 @@ pub fn run() {
             list_vault,
             read_note,
             read_external_note,
+            read_external_text_note,
             take_pending_external_files,
             rename_note,
             save_note,
             save_external_note,
+            save_external_text_note,
             save_recovery_candidate,
             save_external_recovery_candidate,
+            save_external_text_recovery_candidate,
             delete_note,
             delete_notes,
             create_folder,

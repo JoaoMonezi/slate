@@ -1,6 +1,6 @@
 [package]
 name = "slate"
-version = "0.1.10"
+version = "0.1.11"
 description = "Aplicativo local-first de notas em Markdown"
 authors = ["João Monezi"]
 edition = "2024"
@@ -27,6 +27,7 @@ tempfile = "3"
 tauri-plugin-log = "2.10.1"
 log = "0.4.35"
 sha2 = "0.11.1"
+encoding_rs = "0.8"
 windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem"] }
 tauri-plugin-updater = "2"
 tauri-plugin-process = "2"

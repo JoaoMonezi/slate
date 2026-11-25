@@ -22,6 +22,7 @@ const VAULT_STORAGE_KEY = "slate.vaultPath";
 const LANGUAGE_STORAGE_KEY = "slate.language";
 const FONT_FAMILY_STORAGE_KEY = "slate.fontFamily";
 const FONT_SIZE_STORAGE_KEY = "slate.fontSize";
+const MENU_PINNED_STORAGE_KEY = "slate.menuPinned";
 type FontFamily = "inter" | "segoe" | "consolas" | "georgia";
 const FONT_FAMILIES: Record<FontFamily, string> = {
   inter: "Inter, ui-sans-serif, system-ui, sans-serif",
@@ -43,6 +44,14 @@ function TrashIcon() {
   return (
     <svg viewBox="0 0 20 20" aria-hidden="true">
       <path d="M4 6h12M8 6V4h4v2m-6 0 .7 10h6.6L14 6m-5 3v4m2-4v4" />
+    </svg>
+  );
+}
+
+function PinIcon() {
+  return (
+    <svg viewBox="0 0 20 20" aria-hidden="true">
+      <path d="m13.8 2.8 3.4 3.4-2.4 1.2-2.2 3.7 1.8 1.8-1.5 1.5-3.5-3.5-4.8 5-.8-.8 5-4.8-3.5-3.5L7 5.3l1.8 1.8 3.7-2.2 1.3-2.1Z" />
     </svg>
   );
 }
@@ -711,6 +720,7 @@ function App() {
   const [searchMode, setSearchMode] = useState<"results" | "tree">("results");
   const [searchBusy, setSearchBusy] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
+  const [menuPinned, setMenuPinned] = useState(() => localStorage.getItem(MENU_PINNED_STORAGE_KEY) === "true");
   const [searchOpen, setSearchOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [selectedFolder, setSelectedFolder] = useState("Draft");
@@ -966,9 +976,9 @@ function App() {
     currentContent.current = sessionNote.content;
     currentBlockDocumentJson.current = sessionNote.blockDocumentJson ?? "";
     persistedMarkdownByPath.current.set(note.relativePath, note.content);
-    setMenuOpen(false);
+    if (!menuPinned) setMenuOpen(false);
     setSearchOpen(false);
-  }, []);
+  }, [menuPinned]);
 
   useEffect(() => {
     if (!noteContextMenu) return;
@@ -1368,7 +1378,7 @@ function App() {
       noteSessions.current.delete(sourcePath);
       persistedMarkdownByPath.current.set(movedNote.relativePath, movedNote.content);
       setSelectedFolder("Draft");
-      setMenuOpen(false);
+      if (!menuPinned) setMenuOpen(false);
     } catch (cause) {
       setError(String(cause));
     }
@@ -1744,9 +1754,24 @@ function App() {
                 <p className="eyebrow">{t("navigate")}</p>
                 <h2>{t("foldersAndNotes")}</h2>
               </div>
-              <button className="icon-button" onClick={() => setMenuOpen(false)} aria-label={t("closeMenu")}>
-                ×
-              </button>
+              <div className="panel-heading-actions">
+                <button
+                  className={`icon-button ${menuPinned ? "active" : ""}`}
+                  onClick={() => setMenuPinned((current) => {
+                    const next = !current;
+                    localStorage.setItem(MENU_PINNED_STORAGE_KEY, String(next));
+                    return next;
+                  })}
+                  aria-label={t(menuPinned ? "unpinMenu" : "pinMenu")}
+                  title={t(menuPinned ? "unpinMenu" : "pinMenu")}
+                  aria-pressed={menuPinned}
+                >
+                  <PinIcon />
+                </button>
+                <button className="icon-button" onClick={() => setMenuOpen(false)} aria-label={t("closeMenu")} title={t("closeMenu")}>
+                  ×
+                </button>
+              </div>
             </div>
             {selectedNotePaths.size > 0 && (
               <div className="selection-actions">
